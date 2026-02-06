@@ -1619,7 +1619,8 @@ static bool record_context(struct i915_gem_context_coredump *e,
 		return true;
 	}
 
-	strcpy(e->comm, i915_drm_client_name(ctx->client));
+	strncpy(e->comm, i915_drm_client_name(ctx->client), sizeof(e->comm) - 1);
+		e->comm[sizeof(e->comm) - 1] = '\0';
 	e->pid = pid_nr(i915_drm_client_pid(ctx->client));
 	e->uid = i915_drm_client_uid(ctx->client);
 
