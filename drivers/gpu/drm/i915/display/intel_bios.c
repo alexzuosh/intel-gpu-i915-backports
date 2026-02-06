@@ -1683,6 +1683,9 @@ static int goto_next_sequence(const u8 *data, int index, int total)
 		u8 operation_byte = *(data + index);
 		index++;
 
+		if (index >= total)
+			return 0;
+
 		switch (operation_byte) {
 		case MIPI_SEQ_ELEM_END:
 			return index;
@@ -1691,6 +1694,8 @@ static int goto_next_sequence(const u8 *data, int index, int total)
 				return 0;
 
 			len = *((const u16 *)(data + index + 2)) + 4;
+			if (len > total - index)
+				return 0;
 			break;
 		case MIPI_SEQ_ELEM_DELAY:
 			len = 4;
@@ -1702,11 +1707,14 @@ static int goto_next_sequence(const u8 *data, int index, int total)
 			if (index + 7 > total)
 				return 0;
 			len = *(data + index + 6) + 7;
+			if (len > total - index)
+				return 0;
 			break;
 		default:
 			DRM_ERROR("Unknown operation byte\n");
 			return 0;
 		}
+	}
 	}
 
 	return 0;
