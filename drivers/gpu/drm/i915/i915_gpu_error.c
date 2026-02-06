@@ -1683,7 +1683,8 @@ capture_vma(struct intel_engine_capture_vma *next,
 	    i915_vma_active_acquire_if_busy(vma))
 		c->pages = vma->pages;
 
-	strcpy(c->name, name);
+	strncpy(c->name, name, sizeof(c->name) - 1);
+		c->name[sizeof(c->name) - 1] = '\0';
 	c->vma = vma; /* reference held while active */
 
 	c->next = next;
