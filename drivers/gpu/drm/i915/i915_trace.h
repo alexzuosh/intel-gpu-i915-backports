@@ -952,7 +952,8 @@ TRACE_EVENT(i915_mm_fault,
 				   __entry->obj_size = 0;
 				   __entry->vma_size = 0;
 				   __entry->is_bound = false;
-				   strcpy(__entry->region, "none");
+				   strncpy(__entry->region, "none", sizeof(__entry->region) - 1);
+				   __entry->region[sizeof(__entry->region) - 1] = '\0';
 			   }
 			   __entry->addr = info->page_addr;
 			   __entry->asid = info->asid;
