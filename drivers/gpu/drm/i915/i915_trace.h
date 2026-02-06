@@ -899,7 +899,8 @@ TRACE_EVENT(i915_gem_object_migrate,
 			   __entry->dev = obj->base.dev->primary->index;
 			   __entry->obj = obj;
 			   __entry->size = obj->base.size;
-			   strcpy(__entry->src, obj->mm.region.mem->name);
+			   strncpy(__entry->src, obj->mm.region.mem->name, sizeof(__entry->src) - 1);
+			   __entry->src[sizeof(__entry->src) - 1] = '\0';
 			   strcpy(__entry->dst, region->name);
 			   __entry->has_pages = i915_gem_object_has_pages(obj);
 			   ),
