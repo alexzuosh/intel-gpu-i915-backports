@@ -1,0 +1,65 @@
+From d11df8f4c38c4c246e3ce47d76eb45a66d069348 Mon Sep 17 00:00:00 2001
+From: GitHub Copilot <copilot@example.com>
+Date: Thu, 29 Jan 2026 20:56:08 -0800
+Subject: [PATCH] drm/i915/gem: Implement adaptive polling for user fence wait
+
+Sometimes the ufence data is not visible to the CPU when the GPU interrupt
+fires, causing a mismatch check. If no further interrupts occur, the wait
+can hang indefinitely. This is likely due to delays in PCIe TLP updates
+where the data arrives in system memory after the interrupt.
+
+To address this, implement an adaptive polling mechanism in
+i915_gem_wait_user_fence_ioctl:
+- Initialize a poll_timeout starting at ~10us.
+- If the wait times out (or is interrupted) without a signal, check memory
+  again.
+- Exponentially back off the polling interval (doubling it) up to ~200ms
+  to avoid excessive CPU usage while ensuring we eventually see the data.
+
+This ensures robust handling of delayed memory updates without relying
+solely on interrupts.
+---
+ drivers/gpu/drm/i915/gem/i915_gem_wait_user_fence.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_wait_user_fence.c b/drivers/gpu/drm/i915/gem/i915_gem_wait_user_fence.c
+index 2a56406..bbd2202 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_wait_user_fence.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_wait_user_fence.c
+@@ -349,7 +349,7 @@ int i915_gem_wait_user_fence_ioctl(struct drm_device *dev,
+ 	struct i915_gem_context *ctx = NULL;
+ 	struct engine_wait g_wait, c_wait;
+ 	struct ufence_wake wake;
+-	unsigned long timeout;
++	unsigned long timeout, poll_timeout;
+ 	ktime_t start;
+ 	int err;
+ 
+@@ -458,6 +458,7 @@ int i915_gem_wait_user_fence_ioctl(struct drm_device *dev,
+ 		dma_latency_boost();
+ 	}
+ 
++	poll_timeout = usecs_to_jiffies(10) + 1;
+ 	for (;;) {
+ 		set_current_state(TASK_INTERRUPTIBLE);
+ 
+@@ -492,7 +493,15 @@ int i915_gem_wait_user_fence_ioctl(struct drm_device *dev,
+ 		if (busy_wait(&wake, jiffies_to_nsecs(1)))
+ 			break;
+ 
+-		timeout = i915_tbb_schedule(timeout);
++		if (timeout < MAX_SCHEDULE_TIMEOUT) {
++			unsigned long wait = min(timeout, poll_timeout);
++
++			timeout -= wait - i915_tbb_schedule(wait);
++		} else {
++			i915_tbb_schedule(poll_timeout);
++		}
++
++		poll_timeout = min(poll_timeout << 1, msecs_to_jiffies(200) + 1);
+ 
+ 		if (ufence_fault(&wake)) {
+ 			err = -EFAULT;
+-- 
+2.34.1
+
