@@ -340,7 +340,7 @@ void i915_gem_object_set_pat_index(struct drm_i915_gem_object *obj,
 		obj->flags |= (I915_BO_CACHE_COHERENT_FOR_READ |
 			       I915_BO_CACHE_COHERENT_FOR_WRITE);
 	else if (i915_gem_object_use_llc(obj))
-		obj->flags = I915_BO_CACHE_COHERENT_FOR_READ;
+		obj->flags |= I915_BO_CACHE_COHERENT_FOR_READ;
 
 	GEM_BUG_ON(i915_gem_object_pat_index(obj) != pat_index);
 }
