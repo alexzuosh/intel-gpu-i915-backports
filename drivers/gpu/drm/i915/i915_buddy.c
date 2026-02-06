@@ -204,9 +204,9 @@ int i915_buddy_init(struct i915_buddy_mm *mm, u64 start, u64 end, u64 chunk)
 		size -= BIT_ULL(order);
 	} while (size);
 
-	mm->roots = krealloc(roots, i * sizeof(*roots), GFP_KERNEL);
-	if (!mm->roots) /* Can't reduce our allocation, keep it all! */
-		mm->roots = roots;
+	/* Try to shrink allocation to actual size; fallback to original if realloc fails */
+	struct i915_buddy_block **resized = krealloc(roots, i * sizeof(*roots), GFP_KERNEL);
+	mm->roots = resized ? resized : roots;
 	mm->n_roots = i;
 
 	GEM_BUG_ON(mm->max_order < ilog2(chunk));
