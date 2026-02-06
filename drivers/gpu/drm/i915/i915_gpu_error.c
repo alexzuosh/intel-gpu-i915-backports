@@ -1529,6 +1529,7 @@ i915_uuid_capture_string(struct i915_uuid_resource *uuid_res)
 		return NULL;
 
 	strncpy(s, (const char *)uuid_res->ptr, uuid_res->size);
+	s[uuid_res->size] = '\0';
 	return s;
 }
 
