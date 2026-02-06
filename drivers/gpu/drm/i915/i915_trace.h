@@ -1053,7 +1053,8 @@ TRACE_EVENT(i915_vm_prefetch,
 			   __entry->vm_id = vm_id;
 			   __entry->start = start;
 			   __entry->len = len;
-			   strcpy(__entry->region, region->name);
+			   strncpy(__entry->region, region->name, sizeof(__entry->region) - 1);
+			   __entry->region[sizeof(__entry->region) - 1] = '\0';
 			   ),
 
 	    TP_printk("dev %d prefetch va start %llx (len %llx) to region %s for vm %d",
