@@ -1241,7 +1241,8 @@ i915_vma_coredump_create(const struct intel_gt *gt,
 	if (!dst)
 		return NULL;
 
-	strcpy(dst->name, name);
+	strncpy(dst->name, name, sizeof(dst->name) - 1);
+		dst->name[sizeof(dst->name) - 1] = '\0';
 	dst->next = NULL;
 	dst->gtt_offset = vma->node.start;
 	dst->gtt_size = vma->node.size;
