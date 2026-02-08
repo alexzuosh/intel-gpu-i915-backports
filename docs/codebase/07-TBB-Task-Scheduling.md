@@ -1046,6 +1046,473 @@ Time:
 
 ---
 
+## Deep Dive: TBB Scheduling Architecture
+
+### Task Submission and Work-Stealing
+
+```plantuml
+@startuml
+title TBB Task Submission and Work-Stealing Algorithm
+
+participant "Task Creator" as creator
+participant "CPU 0 Queue" as q0
+participant "CPU 1 Queue" as q1
+participant "CPU 2 Queue" as q2
+participant "CPU 3 Queue" as q3
+
+== Scenario: Multiple CPUs, Varying Load ==
+
+creator -> q0: Submit task_1\n(running on CPU 0)
+creator -> q1: Submit task_2\n(running on CPU 1)
+creator -> q2: Submit task_3\n(running on CPU 2)
+
+q0 -> q0: Queue: [task_1]
+q1 -> q1: Queue: [task_2]
+q2 -> q2: Queue: [task_3]
+q3 -> q3: Queue: []
+
+== Work Stealing: CPU 3 is Idle ==
+
+q3 -> q3: CPU 3 thread wakes\nlocal queue empty
+
+q3 -> q2: Try steal from neighbor\nCPU 2 queue
+
+alt Steal Successful
+  q2 -> q3: task_3 stolen\nq2 has backup copies
+  
+  q3 -> q3: Execute task_3\nlocally
+  
+else Nothing to Steal
+  q3 -> q1: Try steal from CPU 1
+  
+  q1 -> q3: task_2 stolen\nif available
+  
+  q3 -> q3: Execute task_2
+end
+
+== Load Balancing Result ==
+
+q0 -> q0: [task_1] - CPU 0 busy
+q1 -> q1: [] - CPU 1 work stolen
+q2 -> q2: [] - CPU 2 work stolen
+q3 -> q3: [task_3] - CPU 3 executing
+
+note right of q3
+All cores utilized
+no idle CPUs
+end note
+
+@enduml
+```
+
+### NUMA-Aware Task Distribution
+
+```plantuml
+@startuml
+title NUMA-Aware Task Distribution: Per-Node Queues
+
+rectangle "NUMA Node 0\n(CPUs 0-3, Memory Bank 0)" as node0 {
+  queue "Node 0 Queue" as n0_q {
+    database "Task A (GPU work)" as n0_task_a
+    database "Task C (memory migration)" as n0_task_c
+  }
+  
+  database "Task Execution\nCPU 0-3" as n0_exec
+  database "Local Memory\nBand width: 100GB/s" as n0_mem
+}
+
+rectangle "NUMA Node 1\n(CPUs 4-7, Memory Bank 1)" as node1 {
+  queue "Node 1 Queue" as n1_q {
+    database "Task B (GuC work)" as n1_task_b
+    database "Task D (error handler)" as n1_task_d
+  }
+  
+  database "Task Execution\nCPU 4-7" as n1_exec
+  database "Local Memory\nBandwidth: 100GB/s" as n1_mem
+}
+
+n0_task_a --> n0_mem: Access node0 memory\nfast (100GB/s)
+n0_task_c --> n0_mem: Local memory\noptimal NUMA behavior
+
+n1_task_b --> n1_mem: Node 1 local memory\nfast
+n1_task_d --> n1_mem: Local access
+
+n0_mem -.-> node1: If must access node1:\nslower (25GB/s)\ncross-QPI latency
+
+note right of node0
+Tasks preferentially
+executed on local
+CPUs to access
+local memory
+end note
+
+note right of node1
+NUMA-aware scheduling
+improves locality
+reduces cross-node
+traffic
+end note
+
+@enduml
+```
+
+### CPU Affinity: Primary vs Secondary vs NOHZ
+
+```plantuml
+@startuml
+title CPU Affinity: Three-Tier Execution Strategy
+
+participant "Task" as task
+participant "Scheduler" as sched
+participant "Primary Core\n(High Priority)" as primary
+participant "Secondary Core\n(Normal Priority)" as secondary
+participant "NOHZ Core\n(Idle Priority)" as nohz
+
+== Task Submission ==
+
+task -> sched: Submit task\nno specific CPU requirement
+
+sched -> sched: Determine NUMA node\nof submitting CPU
+
+== Selection Logic ==
+
+sched -> primary: Check primary core\navailable in node?
+
+alt Primary Available
+  primary -> primary: High priority thread\nready immediately
+  
+  primary -> primary: Task executes\non primary core
+  
+  note right of primary
+  Dedicated OS-managed core
+  responsive execution
+  typical case
+  end note
+else Primary Busy
+  sched -> secondary: Try secondary core\n(non-exclusive, shared)
+  
+  secondary -> secondary: May be shared\nwith other OS work
+  
+  secondary -> secondary: Task executes\nnormal priority
+  
+else Secondary Also Full
+  sched -> nohz: Last resort:\nuse NOHZ core\n(isolated core)
+  
+  nohz -> nohz: Very low priority\nIDLE scheduling
+  
+  nohz -> nohz: Only execute if\nactually idle
+  
+  note right of nohz
+  NOHZ-full isolated
+  core reserved for
+  user applications
+  only use if empty
+  end note
+end
+
+@enduml
+```
+
+### Thread Pool Model: Per-CPU Threads
+
+```plantuml
+@startuml
+title Thread Pool Model: Per-CPU Architecture
+
+rectangle "System (8 CPUs, 2 NUMA)" {
+  rectangle "NUMA Node 0\n(CPUs 0-3)" {
+    rectangle "CPU 0" {
+      database "TBB Thread 0\nPriority: FIFO (high)" as t0
+    }
+    rectangle "CPU 1" {
+      database "TBB Thread 1\nPriority: NORMAL" as t1
+    }
+    rectangle "CPU 2" {
+      database "TBB Thread 2\nPriority: FIFO (high)" as t2
+    }
+    rectangle "CPU 3" {
+      database "TBB Thread 3\nPriority: IDLE" as t3
+    }
+  }
+  
+  rectangle "NUMA Node 1\n(CPUs 4-7)" {
+    rectangle "CPU 4" {
+      database "TBB Thread 4\nPriority: FIFO (high)" as t4
+    }
+    rectangle "CPU 5" {
+      database "TBB Thread 5\nPriority: NORMAL" as t5
+    }
+    rectangle "CPU 6" {
+      database "TBB Thread 6\nPriority: FIFO (high)" as t6
+    }
+    rectangle "CPU 7\n(nohz_full)" {
+      database "TBB Thread 7\nPriority: IDLE\n(avoid if possible)" as t7
+    }
+  }
+}
+
+note right of t0
+High priority
+OS-managed core
+responsive
+end note
+
+note right of t1
+Shared with other
+OS kernel threads
+normal priority
+end note
+
+note right of t7
+NOHZ isolated core
+only execute if
+core is idle
+end note
+
+@enduml
+```
+
+### Task Execution Latency: Best to Worst Cases
+
+```plantuml
+@startuml
+title TBB Task Execution Latency: Scenarios
+
+participant "Submitter" as sub
+participant "Scheduler" as sch
+participant "Thread" as thr
+participant "Task" as task
+
+== BEST CASE: Primary Core Idle ==
+
+sub -> sch: Submit task
+sch -> sch: Lock node queue\n(10ns)
+
+sch -> thr: Check if primary thread\nrunning
+
+alt Primary thread idle
+  thr -> thr: Immediately available\n(0 wait time)
+  
+  thr -> task: Wake task\nwakeup latency ~2-5μs
+  
+  task -> task: Execute immediately\n(within 5μs)
+  
+  note right of thr
+  Total latency: ~5μs
+  Best case performance
+  immediate execution
+  end note
+end
+
+== MEDIUM CASE: Primary Busy ==
+
+sch -> thr: Primary busy\nchecking queue depth
+
+alt Queue has space
+  sch -> sch: Append task to queue\n(queue append ~10ns)
+  
+  thr -> task: On next quantum\n(10-50μs wait)
+  
+  task -> task: Execute\n(another ~10μs)
+  
+  note right of thr
+  Total latency: ~30-50μs
+  Medium case
+  task queued, normal wait
+  end note
+end
+
+== WORST CASE: All Cores Busy ==
+
+sch -> sch: All node cores saturated\n(checking ~10-20μs)
+
+sch -> sch: Cross-NUMA steal\n(~100μs search latency)
+
+sch -> thr: Wake remote node thread\n(~5-10μs IPI latency)
+
+thr -> task: Execute on remote\n(travel time ~5-20μs)
+
+task -> task: Execute\n(local execution ~10μs)
+
+note right of thr
+Total latency: ~150-200μs
+Worst case
+cross-NUMA execution
+end note
+
+@enduml
+```
+
+### NOHZ-Full Awareness: Preventing Interruption
+
+```plantuml
+@startuml
+title NOHZ-Full Awareness: Avoiding Isolated Cores
+
+rectangle "System Configuration" {
+  database "CPU 0-3: OS-managed\n(can schedule anytime)" as osmanaged
+  database "CPU 4-7: NOHZ-full\n(isolated for real-time\napp)" as nohz_full
+}
+
+participant "TBB Scheduler" as sch
+participant "nohz_full Core\n(e.g., CPU 6)" as nohz_core
+participant "Real-time App" as rtapp
+
+== Normal Load: Avoid NOHZ Core ==
+
+sch -> sch: Task to schedule
+
+sch -> sch: Check CPU masks:\nisol_cpumask =\n{CPU 4, 5, 6, 7}
+
+sch -> osmanaged: Try OS-managed CPUs first\n(CPU 0-3)
+
+osmanaged -> osmanaged: Execute on CPU 0 or 1\n(available)
+
+note right of osmanaged
+Preferred: OS-managed cores
+avoid disturbing NOHZ
+end note
+
+== Heavy Load: Must Use NOHZ ==
+
+sch -> sch: All OS cores saturated\n(CPU 0-3 packed)
+
+sch -> sch: nohz_offload module\nparameter = true?
+
+alt nohz_offload Enabled
+  sch -> nohz_core: Check if CPU 6 idle?\npeek at nohz state
+  
+  alt CPU 6 Actually Idle
+    nohz_core -> nohz_core: Execute task at\nIDLE priority
+    
+    rtapp -> rtapp: Real-time app\nstill sleeping
+    
+    note right of nohz_core
+    Task executes cleanly
+    no RT app interruption
+    end note
+  else CPU 6 Running RT
+    sch -> osmanaged: Do not use CPU 6\ntry work-steal instead
+  end
+end
+
+@enduml
+```
+
+### Task Queue Lock-Free Design
+
+```plantuml
+@startuml
+title Task Queue: Lock-Free Append and Steal
+
+participant "Submitter CPU" as sub
+participant "Local Queue\n(head/tail)" as queue
+participant "Worker Thread" as worker
+
+== Append (Fast Path, O(1)) ==
+
+sub -> queue: READ tail pointer\n(atomic read)
+
+sub -> sub: Allocate local task slot\nin queue
+
+sub -> queue: WRITE task to slot\n(before updating tail)
+
+sub -> queue: WRITE tail pointer\n(CAS operation)\n(atomic compare-and-swap)
+
+alt CAS Success
+  sub -> sub: Task appended\ncontinue
+else CAS Conflict
+  sub -> sub: Retry from READ tail\n(very rare)
+end
+
+== Worker Processing (Dequeue) ==
+
+worker -> queue: READ head pointer
+
+worker -> queue: READ task from queue[head]
+
+worker -> queue: Process task
+
+worker -> queue: Increment head\n(WRITE back)\n(CAS if needed)
+
+== Work Stealing ==
+
+worker -> queue: Worker queue empty?
+
+worker -> worker: Try steal from neighbor
+
+worker -> worker: READ neighbor head\n(peek operation)
+
+worker -> worker: Peek at next task\n(speculative read)
+
+worker -> worker: READ neighbor tail
+
+alt Neighbor has work
+  worker -> worker: Attempt steal\n(atomic compare-and-swap)
+end
+
+note right of queue
+Lock-free design avoids
+spinlock overhead
+enables fast appends
+critical for latency
+end note
+
+@enduml
+```
+
+### Task Wakeup and Coalescing
+
+```plantuml
+@startuml
+title Task Wakeup: Coalescing Multiple Tasks
+
+participant "Submitter 1" as sub1
+participant "Submitter 2" as sub2
+participant "Submitter 3" as sub3
+participant "Node Queue" as queue
+participant "Worker Thread" as worker
+
+== Multiple Tasks Submitted ==
+
+sub1 -> queue: Submit task_A
+sub1 -> queue: Submit task_B
+
+sub2 -> queue: Submit task_C
+
+sub3 -> queue: Submit task_D
+sub3 -> queue: Submit task_E
+
+queue -> queue: Queue now has 5 tasks:\n[A, B, C, D, E]
+
+== Coalesced Wakeup ==
+
+queue -> queue: Check thread status\n(is worker sleeping?)
+
+alt Worker Sleeping
+  queue -> worker: Single wakeup\nfor 5 tasks!
+  
+  worker -> worker: Wake from sleep\nlatency ~5μs
+  
+  worker -> queue: Drain all queued tasks\nin batch
+  
+  worker -> worker: Process A, B, C, D, E\nsequentially
+  
+  note right of worker
+  Key benefit:
+  One wakeup for 5 tasks
+  amortized overhead
+  ~1μs per task
+  end note
+else Worker Already Running
+  queue -> queue: No wakeup needed\nworker will pick up\nnew tasks when ready
+end
+
+@enduml
+```
+
+---
+
 ## Debugging & Monitoring
 
 ### SysRq Support

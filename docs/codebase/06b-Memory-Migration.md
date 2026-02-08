@@ -753,6 +753,376 @@ int i915_lmem_defragment(struct intel_memory_region *mem)
 
 ---
 
+## Deep Dive: Memory Migration Architecture
+
+### Region Migration Triggers and Flow
+
+```plantuml
+@startuml
+title Memory Migration: Triggers and Execution Flow
+
+participant "Workload" as work
+participant "GPU Engine" as gpu
+participant "Memory Manager" as mgr
+participant "Source Region" as src
+participant "Target Region" as tgt
+participant "DMA Engine" as dma
+
+== Trigger 1: Target Region Specified ==
+
+work -> mgr: allocate(size, INTEL_MEMORY_LMEM)
+mgr -> mgr: Check available LMEM
+
+alt LMEM has space
+  mgr -> tgt: Create object in LMEM\n(direct allocation)
+else LMEM full
+  mgr -> mgr: Trigger eviction\nfrom LMEM
+  
+  mgr -> src: Select evictable LMEM objects
+  
+  src -> src: Find LRU candidates\n(least recently used)
+  
+  src -> tgt: Migrate victim to system RAM
+  
+  mgr -> tgt: Now allocate in LMEM
+end
+
+== Trigger 2: Access Pattern Detected ==
+
+gpu -> work: GPU renders to SYSTEM region
+gpu -> gpu: Cache hit rate low\n(60% misses)
+
+mgr -> mgr: Monitor performance\ncounters
+
+mgr -> mgr: Detect: SYSTEM object\nwith GPU workload
+
+mgr -> tgt: Migrate to LMEM\nfor better performance
+
+dma -> dma: Background migration\nduring GPU idle
+
+tgt -> tgt: Object now in LMEM\nGPU cache friendly
+
+@enduml
+```
+
+### Memory Pressure and Shrinker Response
+
+```plantuml
+@startuml
+title Memory Pressure: Shrinker Callback Chain
+
+participant "OS Memory Subsystem" as os
+participant "i915 Shrinker" as shrinker
+participant "Object Manager" as objmgr
+participant "Eviction Logic" as evict
+participant "Region Allocator" as region
+
+== High Memory Pressure ==
+
+os -> os: System RAM usage: 95%\nTriggers memory reclaim
+
+os -> shrinker: notify_pressure(target_KB)\nreclaim 512MB
+
+shrinker -> shrinker: Calculate freeable KB\nby scanning LRU
+
+shrinker -> objmgr: Scan all GEM objects\nin priority order:
+objmgr -> objmgr: 1. Purgeable objects\n2. Shared objects\n3. Used objects
+
+== Eviction Decision ==
+
+objmgr -> evict: Select eviction targets\nfor highest impact
+
+evict -> evict: Consider:
+evict -> evict: • Object size (free most)
+evict -> evict: • Last access time (LRU)
+evict -> evict: • Current mappings (cost)
+evict -> evict: • Move to which region?
+
+== Execution ==
+
+evict -> region: Start moving objects:
+region -> region: Object 1: LMEM→System\n(512MB freed)
+
+region -> region: Object 2: Unmapped\n(256MB freed)
+
+region -> region: Object 3: LMEM→System\n(256MB freed)
+
+shrinker -> os: Freed: 1024MB\nCompleted reclaim
+
+@enduml
+```
+
+### Object Lifecycle with Multi-Region Movement
+
+```plantuml
+@startuml
+title GEM Object Lifecycle: Multi-Region Movement
+
+state "Creation" as st_create {
+  [*] --> allocate: app calls<br/>gem_create(size,<br/>flags)
+  
+  allocate --> region_select: Choose region<br/>based on flags
+  
+  region_select --> [*]
+}
+
+state "Allocation" as st_alloc {
+  [*] --> allocate_obj: Allocate object<br/>in selected region
+  
+  allocate_obj --> track: Track in region's<br/>object list
+  
+  track --> [*]
+}
+
+state "Active Use" as st_use {
+  [*] --> gpu_access: GPU access\n(typical case)
+  
+  gpu_access --> cache: Access pattern<br/>builds cache<br/>locality
+  
+  cache --> monitor: Monitor hit rates\nand latency
+  
+  monitor --> [*]
+}
+
+state "Migration" as st_migrate {
+  [*] --> detect: Detect need to move:<br/>• Eviction pressure<br/>• Access pattern<br/>• Explicit hint
+  
+  detect --> prep: Prepare source region\n(flush caches, mark idle)
+  
+  prep --> dma_transfer: DMA transfer to<br/>destination region
+  
+  dma_transfer --> update_ptables: Update page tables\nfor new location
+  
+  update_ptables --> tlb_shoot: TLB shootdown\nto invalidate old<br/>translations
+  
+  tlb_shoot --> [*]
+}
+
+state "Release" as st_release {
+  [*] --> unmap: Unmap from VMAs
+  
+  unmap --> free: Return pages to<br/>region allocator
+  
+  free --> cleanup: Remove from region<br/>tracking list
+  
+  cleanup --> [*]
+}
+
+st_create --> st_alloc
+st_alloc --> st_use
+st_use --> st_migrate: Eviction or<br/>optimization
+st_migrate --> st_use: Continue work
+st_use --> st_release: Final close()
+st_migrate --> st_release: On eviction<br/>completion
+
+@enduml
+```
+
+### CPU-GPU Coherency Models During Migration
+
+```plantuml
+@startuml
+title CPU-GPU Coherency: Synchronization During Migration
+
+participant "CPU" as cpu
+participant "CPU Cache" as cpucache
+participant "GPU" as gpu
+participant "GPU Cache" as gpucache
+participant "Memory Bus" as bus
+participant "Region Memory" as mem
+
+== Case 1: Coherent System Region ==
+
+cpu -> cpucache: Write data\n(WB, cached)
+
+cpucache -> cpucache: Data in L1/L2/L3
+
+gpu -> gpucache: GPU read\n(COHERENT)
+
+alt GPU sees dirty CPU cache
+  bus -> cpucache: Snoop: is data dirty?
+  
+  cpucache -> bus: Yes, valid value\n(snooped coherency)
+  
+  bus -> gpucache: GPU gets latest\n(via snoop)
+else CPU already flushed
+  cpucache -> gpucache: Clean cache\nGPU gets data
+end
+
+gpu -> mem: GPU write\n(WB cached)
+
+cpu -> cpucache: CPU read\n(COHERENT)
+
+cpucache -> bus: Snoop for GPU writes
+bus -> gpucache: GPU cache coherent\n(flushed on GPU)
+
+cpu -> cpucache: CPU gets latest\n(snoop hit)
+
+== Case 2: Non-Coherent LMEM (Discrete) ==
+
+gpu -> mem: Write to LMEM\n(fast, GPU-native)
+
+gpu -> gpucache: Data in GPU cache
+
+cpu -> cpu: Wants to read\nLMEM data
+
+cpu -> cpu: GPU flush required\n(explicit sync)
+
+gpu -> gpu: clflush LMEM\n(GPU-side flush)
+
+gpu -> mem: Data now in LMEM\n(non-cached)
+
+cpu -> mem: Read from LMEM\n(via PCIe BAR)\nSlower access
+
+@enduml
+```
+
+### Memory Defragmentation Strategy
+
+```plantuml
+@startuml
+title Memory Defragmentation: Compacting Fragmented Regions
+
+participant "Allocator" as alloc
+participant "LMEM\n(Fragmented)" as lmem
+participant "Free List\n(scattered)" as freelist
+participant "Migration Engine" as mig
+participant "LMEM\n(Compacted)" as lmem2
+
+== Initial State: Fragmentation ==
+
+lmem -> lmem: Layout:\n[Obj-A: 512MB]\n[FREE: 256MB]\n[Obj-B: 256MB]\n[FREE: 512MB]\n[Obj-C: 256MB]\n[FREE: 256MB]
+
+alloc -> alloc: Try allocate 384MB\n(exactly fits\nin largest gap)
+
+alloc -> freelist: Check free list\nlargest: 512MB\n2nd: 512MB\n3rd: 256MB
+
+== Defragmentation Decision ==
+
+alloc -> alloc: Fragmentation ratio\nhigh (50% free,\nbut scattered)
+
+alloc -> mig: Trigger compaction:\n"Consolidate free space"
+
+== Compaction Execution ==
+
+mig -> lmem: Identify movable\nobjects: B, C\n(can be migrated)
+
+mig -> mig: Reorder:\nMove B to fill\ngap after A
+
+mig -> lmem2: Execute moves\n(background DMA)
+
+lmem2 -> lmem2: New layout:\n[Obj-A: 512MB]\n[Obj-B: 256MB]\n[Obj-C: 256MB]\n[FREE: 1024MB]\n(contiguous!)
+
+alloc -> lmem2: Now allocate 384MB\nfrom contiguous gap\nsuccess!
+
+@enduml
+```
+
+### Eviction Priority Ordering
+
+```plantuml
+@startuml
+title Eviction Priority: LRU and Object Classification
+
+database "LMEM Objects" as objs {
+  database "Tier 1\n(Very High Priority)" as t1 {
+    state "Purgeable\nObjects" as pur
+    note right of pur
+    • Shareable buffers
+    • Cached pixel data
+    • Can be rebuilt
+    • Evict first!
+    end note
+  }
+  
+  database "Tier 2\n(High Priority)" as t2 {
+    state "Idle Objects" as idle
+    note right of idle
+    • Unused for >10ms
+    • No active refs
+    • Evict second
+    end note
+  }
+  
+  database "Tier 3\n(Normal Priority)" as t3 {
+    state "Active Read-Only" as ro
+    note right of ro
+    • Currently mapped
+    • Read-only access
+    • GPU/CPU accessing
+    • Cost to evict: medium
+    end note
+  }
+  
+  database "Tier 4\n(Low Priority)" as t4 {
+    state "Active Read-Write" as rw
+    note right of rw
+    • GPU actively writing
+    • Dirty cache lines
+    • High eviction cost
+    • Avoid if possible
+    end note
+  }
+}
+
+note bottom of objs
+Within each tier,
+use LRU (least recently used)
+older objects evicted first
+end note
+
+@enduml
+```
+
+### Multi-Region Migration: System ↔ LMEM ↔ Stolen
+
+```plantuml
+@startuml
+title Multi-Region Migration: Cross-Region Movement
+
+participant "Object\nSYSTEM" as sys
+participant "Source\nRegion Mgr" as src_mgr
+participant "DMA\nEngine" as dma
+participant "Target\nRegion Mgr" as tgt_mgr
+participant "Object\nLMEM" as lmem
+
+== Typical Migration Path ==
+
+sys -> src_mgr: Object in SYSTEM\n(512MB)\nAccess rate: high
+
+src_mgr -> src_mgr: Analyze:\nGPU workload\naccessing object\nconstantly
+
+src_mgr -> src_mgr: Decision:\nMove to LMEM\nfor 10x better\ncache locality
+
+src_mgr -> dma: Prepare source:\n• Mark as unmappable\n• Flush CPU caches\n• Flush GPU caches
+
+dma -> dma: DMA transfer\nSYSTEM→LMEM\n(512MB@PCIe Gen4)\n(~40GB/s)\n(~13ms)
+
+dma -> tgt_mgr: Transfer complete\nsignal target
+
+tgt_mgr -> tgt_mgr: Update page tables\nin target region\n(GPT entries→LMEM\nPAs)
+
+tgt_mgr -> lmem: Update object\nmetadata:\nregion = LMEM\nPAs = [...new...]
+
+sys -> lmem: Object migration\ncomplete\n\nSYSTEM→LMEM\ndone
+
+== Reverse Migration ==
+
+lmem -> lmem: LMEM pressure\n(95% full)\nneed 256MB
+
+tgt_mgr -> tgt_mgr: Select LRU object:\nthis 512MB object\n(idle for >100ms)
+
+tgt_mgr -> src_mgr: Prepare SYSTEM\nregion\nfor receive
+
+dma -> dma: DMA transfer\nLMEM→SYSTEM\n512MB
+
+src_mgr -> sys: Object back\nin SYSTEM region
+
+@enduml
+```
+
+---
+
 ## Debugging Memory Issues
 
 ### Inspecting Memory State
