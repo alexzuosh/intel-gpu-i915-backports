@@ -539,6 +539,520 @@ cat /sys/kernel/debug/dri/0/i915_gem_objects
 # Memory region stats
 cat /sys/kernel/debug/dri/0/memory_regions
 
+---
+
+## Deep Dive: Memory Management Architecture
+
+### Memory Type Hierarchy and Management
+
+```plantuml
+@startuml
+title i915 Memory Type Hierarchy and Management
+
+rectangle "System Memory" as sys_mem {
+  database "CPU RAM\n(DDR4/DDR5)" as ddr
+  database "Pageable Memory\n(swapin/out)" as pageable
+}
+
+rectangle "GPU Local Memory" as gpu_mem {
+  database "VRAM (Local Memory)\nDG1/DG2 cards" as vram
+  database "Shared GPU Memory\n(with CPU)" as shared
+}
+
+rectangle "Volatile GPU Memory" as volatile {
+  database "GPU Caches\n(L3/L4)" as caches
+  database "Registers\nTLB\nLast-Level Cache" as registers
+}
+
+rectangle "GEM Object Management" {
+  database "GEM Objects\n(abstract)\nplatform independent" as gem
+}
+
+gem --> ddr: Can be backed by\nsystem memory
+gem --> vram: Can be backed by\nlocal VRAM
+gem --> pageable: Can be swapped\nto disk
+
+vram --> caches: GPU accesses\nthrough caches
+ddr --> caches: CPU coherent\naccess
+
+note right of sys_mem
+CPU-directly-accessible
+Limited bandwidth
+Unlimited capacity
+end note
+
+note right of gpu_mem
+GPU-optimized
+High bandwidth
+Limited capacity (2-48GB)
+end note
+
+note right of volatile
+Fastest access
+Smallest capacity
+Not persistent
+end note
+
+@enduml
+```
+
+### GEM Object Lifecycle
+
+```plantuml
+@startuml
+title GEM Object Lifecycle: Creation to Destruction
+
+participant "User App" as app
+participant "DRM/i915" as drm
+participant "Buddy Allocator" as buddy
+participant "Memory Region" as region
+participant "GPU MMU" as mmu
+
+== Object Creation ==
+
+app -> drm: gem_create_ioctl(size=4MB)
+
+drm -> drm: Allocate GEM object struct\ni915_gem_object
+
+drm -> drm: Mark as unbound\n(not in any address space yet)
+
+drm -> app: Return GEM handle\nto application
+
+== Object First Use ==
+
+app -> drm: Submit batch referencing object
+
+drm -> drm: Check if object in GPU memory
+
+alt Not Yet Allocated
+  drm -> region: i915_gem_object_create_region()\nRequest memory from region
+  
+  region -> buddy: Allocate from buddy allocator\nFind suitable block
+  
+  buddy -> buddy: Walk buddy tree\nFind free block
+  
+  buddy -> region: Return physical address\nblock [0x100000000:0x200000]
+  
+  region -> drm: Object allocated\nto GPU VRAM
+else Already Allocated
+  drm -> drm: Use existing allocation
+end
+
+== VMA Binding ==
+
+drm -> mmu: Bind object to address space\ni915_vma_bind()
+
+mmu -> mmu: Walk page table\nfor context
+
+mmu -> mmu: Update PTEs with\nobject page addresses
+
+mmu -> mmu: TLB flush\ninvalidate old entries
+
+drm -> drm: Mark as bound\nready for GPU
+
+== GPU Access ==
+
+app -> drm: Submit batch\nreferencing object
+
+drm -> drm: Object already bound\nuse GPU address
+
+app -> app: Batch executes\naccesses GEM object
+
+== Object Eviction (on pressure) ==
+
+drm -> drm: Memory pressure detected\nShrinker triggered
+
+drm -> mmu: Unbind object\nfrom address spaces
+
+mmu -> mmu: Clear PTEs
+mmu -> mmu: TLB shootdown
+
+drm -> buddy: Mark block as free\ni915_buddy_free_block()
+
+buddy -> buddy: Coalesce with adjacent\nfree blocks
+
+region -> region: Object moves to swap\nor CPU memory
+
+note right of region
+Object evicted to
+system memory to
+free up GPU VRAM
+end note
+
+== Object Destruction ==
+
+app -> drm: gem_close_ioctl()\nRelease GEM handle
+
+drm -> drm: Decrement reference count
+
+drm -> drm: Check if last reference
+
+alt Reference Count = 0
+  drm -> mmu: Unbind all VMAs\nfor this object
+  
+  drm -> region: i915_gem_object_pages_fini()\nRelease pages
+  
+  region -> buddy: Free buddy block\nif VRAM allocated
+  
+  drm -> drm: Free GEM object struct
+else Still Referenced
+  drm -> drm: Object remains\nwait for last user
+end
+
+@enduml
+```
+
+### Memory Region Selection & Eviction
+
+```plantuml
+@startuml
+title Memory Region Selection: Placement Strategy
+
+rectangle "Available Regions" {
+  database "System Memory\n(unlimited capacity)" as sys
+  database "GPU VRAM\n(limited, 8-48GB)" as vram_opt
+  database "Shared Memory\n(limited)" as shared
+}
+
+rectangle "Placement Decision" {
+  component "Memory Placement Policy" as policy
+}
+
+policy --> policy: Check object requirements:\n- Placement flags\n- Performance needs\n- Available space
+
+alt Object needs GPU access only
+  policy --> vram_opt: Place in VRAM\nif available
+  vram_opt --> vram_opt: Fast GPU access\nNo CPU access overhead
+else Object needs CPU access
+  policy --> shared: Place in shared memory\nif available
+  shared --> shared: GPU coherent\nCPU accessible
+else GPU optional
+  policy --> sys: Place in system memory\ndefault fallback
+  sys --> sys: Accessible to both\nwith coherency overhead
+end
+
+note right of policy
+Decision based on:
+- Availability
+- Bandwidth needs
+- Power efficiency
+- Thermal constraints
+end note
+
+@enduml
+```
+
+### Buddy Allocator: Block Management
+
+```plantuml
+@startuml
+title Buddy Allocator: Free Block Merging Strategy
+
+rectangle "VRAM Layout (1GB total)" as vram {
+  rectangle "Freed Block" as freed {
+    database "[0x000000:0x100000]\n(1MB) FREE" as b1
+    database "[0x100000:0x200000]\n(1MB) USED" as b2
+    database "[0x200000:0x400000]\n(2MB) FREE" as b3
+  }
+}
+
+== Initial State ==
+
+note right of b3
+After freeing block at
+0x200000 (2MB), check
+if buddy can merge
+end note
+
+== Merge Check ==
+
+b3 --> b3: Check if buddy free:\nBuddy of [0x200000:0x400000]\nis [0x000000:0x200000]
+
+b3 --> b3: [0x000000:0x200000]\ncontains:\n- Used block [0x100000]\n- Free block [0x000000]
+
+b3 --> b3: Buddy NOT free\n(contains used block)\nCannot merge
+
+== Second Eviction ==
+
+note right of b2
+Later, block at 0x100000\nis freed (application done)
+end note
+
+b2 --> b2: Check buddy:\n[0x000000:0x100000]
+
+b2 --> b2: Buddy is FREE!\nCan merge
+
+b2 --> b1: Merge with buddy\n[0x000000:0x100000] +\n[0x100000:0x200000]
+
+b1 -.-> b3: New 2MB free block\n[0x000000:0x200000]
+
+b3 --> b3: Now check if THIS\nbuddy free:\nBuddy is [0x200000:0x400000]\nFREE!
+
+b3 -.-> vram: Final merge:\n[0x000000:0x400000]\n4MB free contiguous
+
+note right of vram
+Merging creates larger
+contiguous blocks for
+future allocations
+Improves fragmentation
+end note
+
+@enduml
+```
+
+### Memory Pressure & Shrinker Callback
+
+```plantuml
+@startuml
+title Memory Pressure: Shrinker Response
+
+participant "Kernel VM Subsystem" as vm
+participant "i915 Shrinker" as shrinker
+participant "Eviction" as evict
+participant "Buddy Allocator" as buddy
+participant "GPU MMU" as mmu
+
+== Memory Pressure Detected ==
+
+vm -> vm: System memory pressure\nlow free pages detected
+
+vm -> shrinker: register_shrinker callback\nRequest memory from drivers
+
+== Shrinker Scan ==
+
+shrinker -> shrinker: Scan GEM objects\nin eviction order
+
+shrinker -> shrinker: Count evictable objects:\n- Unreferenced objects\n- Inactive objects\n- Purgeable objects
+
+shrinker -> vm: Report number of\nevictable pages
+
+== Eviction Decision ==
+
+vm -> vm: Compare available memory\nvs pressure threshold
+
+alt Memory Still Critical
+  vm -> shrinker: Request eviction\nof N pages
+  
+  shrinker -> shrinker: Select victim objects\nby LRU/priority
+  
+  shrinker -> evict: Evict selected objects
+  
+  evict -> mmu: Unbind VMAs\nfrom all address spaces
+  
+  mmu -> mmu: Clear page table entries
+  mmu -> mmu: Invalidate TLBs
+  
+  evict -> buddy: Free VRAM blocks
+  
+  buddy -> vm: VRAM returned\nto free pool
+  
+else Memory Acceptable
+  shrinker -> vm: No eviction needed\nstop scanning
+end
+
+== Recovery ==
+
+note right of evict
+Evicted objects moved to
+system memory or swap
+Can be swapped back in
+when needed
+end note
+
+@enduml
+```
+
+### Virtual Address Space Management (VMA)
+
+```plantuml
+@startuml
+title VMA (Virtual Memory Address) Binding & Mapping
+
+participant "GEM Object" as gem
+participant "Address Space\n(PPGTT)" as as
+participant "Page Table" as pte
+participant "TLB" as tlb
+participant "GPU Engine" as gpu
+
+== VMA Creation ==
+
+gem -> as: i915_vma_create(gem, address_space)\nBind object to address space
+
+as -> as: Find free virtual address\nrange for object
+
+as -> gem: Link GEM object\nto this VMA
+
+== VMA Binding ==
+
+gem -> pte: i915_vma_pin()\nPhysically bind VMA
+
+pte -> pte: Walk page table\nhierarchy
+
+pte -> pte: Allocate PTEs if needed\nfor object size
+
+pte -> pte: Set PTE entries:\nVA[0:size] ->\nPhysical[0:size]
+
+pte -> tlb: i915_tlb_invalidate()\nInvalidate TLB entries
+
+== GPU Access ==
+
+gem -> gpu: GPU batch references\nobject at VA
+
+gpu -> gpu: Fetch commands\nfrom ring buffer
+
+gpu -> pte: GPU MMU translates VA\nto physical address
+
+pte -> pte: Walk page table\nlocal GPU TLB
+
+tlb -> tlb: TLB hit/miss\ntranslate VA->PA
+
+gpu -> gpu: Access physical memory\nvia translated address
+
+== VMA Unbinding ==
+
+gem -> pte: i915_vma_unpin()\nRelease VMA binding
+
+pte -> pte: Clear PTEs for\nthis VMA's VA range
+
+pte -> tlb: Invalidate TLB\nfor this VMA
+
+as -> gem: Remove link
+
+note right of pte
+PTEs specify:
+- Virtual address range
+- Physical address mapping
+- Cacheability
+- Access permissions
+end note
+
+@enduml
+```
+
+### Memory Coherency: CPU-GPU Synchronization
+
+```plantuml
+@startuml
+title Memory Coherency: CPU-GPU Cache Management
+
+participant "CPU Core" as cpu
+participant "CPU Cache" as cpu_cache
+participant "System Memory" as sys_mem
+participant "GPU MMU" as gpu_mmu
+participant "GPU Cache" as gpu_cache
+participant "GPU Engine" as gpu
+
+== CPU Writes Data ==
+
+cpu -> cpu_cache: Write to object\naddress X
+
+cpu_cache -> cpu_cache: Cache line updated\nmarked MODIFIED
+
+== GPU Reads Data ==
+
+gpu -> gpu_mmu: Fetch from address X\nfor GPU batch
+
+gpu_mmu -> gpu_cache: Check cache\naddress X
+
+gpu_cache -> gpu_cache: Cache MISS\ndata not in GPU cache
+
+gpu_mmu -> sys_mem: Fetch from system memory\naddress X
+
+sys_mem -> sys_mem: Return stale data\nCPU cache has newer!
+
+== PROBLEM: Coherency Issue ==
+
+gpu -> gpu: Process stale data\nwrong result!
+
+note right of gpu
+Cache coherency broken!
+CPU cache has newer data
+than system memory
+GPU sees stale data
+end note
+
+== SOLUTION: CPU Flush ==
+
+cpu -> cpu_cache: i915_gem_object_flush_cpu_write_domain()\nExplicit cache flush
+
+cpu_cache -> sys_mem: Flush dirty lines\nto system memory
+
+sys_mem -> sys_mem: Data updated\nlatest values written
+
+== GPU Reads Again ==
+
+gpu -> gpu_mmu: GPU batch tries again
+
+gpu_mmu -> gpu_cache: GPU cache miss
+
+gpu_mmu -> sys_mem: Fetch from memory\naddress X
+
+sys_mem -> sys_mem: Return current data\nCPU-flushed values
+
+gpu -> gpu: Process correct data\nright result!
+
+note right of gpu
+After flush:
+GPU sees current CPU data
+Coherency maintained
+end note
+
+@enduml
+```
+
+### Local Memory Management (dGPU)
+
+```plantuml
+@startuml
+title Local Memory (dGPU): Allocation and Management
+
+rectangle "Discrete GPU (dGPU)" {
+  rectangle "Local Memory (VRAM)" {
+    database "VRAM 0\n(GPU 0 - 8GB)" as vram0
+    database "VRAM 1\n(GPU 1 - 8GB)" as vram1
+  }
+}
+
+rectangle "System Memory" {
+  database "System RAM\n(Shared across GPUs)" as sys_ram
+}
+
+rectangle "Peer-to-Peer" {
+  database "P2P Buffers\n(direct GPU-GPU)" as p2p
+}
+
+== Allocation Strategy ==
+
+vram0 -.-> vram0: Allocate objects\nlarge working sets\nfrequent access
+
+sys_ram -.-> sys_ram: Allocate for\ncpu-gpu sync\nsmall status buffers
+
+== Access Patterns ==
+
+vram0 --> vram0: GPU0: Direct access\nlow latency\nhigh bandwidth\n(100+ GB/s)
+
+vram0 --> sys_ram: GPU0: PCIe access\nto system RAM\nmedium latency\n(15-20 GB/s)
+
+vram1 --> vram0: GPU0: P2P access\nto GPU1 VRAM\nmedium latency\n(similar to PCIe)
+
+note right of vram0
+Local memory
+provides 5-10x
+bandwidth vs PCIe
+Critical for perf
+end note
+
+note right of p2p
+GPU-to-GPU direct
+access without
+going through CPU
+end note
+
+@enduml
+```
+
+---
+
 # Active evictions
 cat /sys/kernel/debug/dri/0/eviction_stats
 ```

@@ -1241,7 +1241,8 @@ i915_vma_coredump_create(const struct intel_gt *gt,
 	if (!dst)
 		return NULL;
 
-	strcpy(dst->name, name);
+	strncpy(dst->name, name, sizeof(dst->name) - 1);
+		dst->name[sizeof(dst->name) - 1] = '\0';
 	dst->next = NULL;
 	dst->gtt_offset = vma->node.start;
 	dst->gtt_size = vma->node.size;
@@ -1528,6 +1529,7 @@ i915_uuid_capture_string(struct i915_uuid_resource *uuid_res)
 		return NULL;
 
 	strncpy(s, (const char *)uuid_res->ptr, uuid_res->size);
+	s[uuid_res->size] = '\0';
 	return s;
 }
 
@@ -1618,7 +1620,8 @@ static bool record_context(struct i915_gem_context_coredump *e,
 		return true;
 	}
 
-	strcpy(e->comm, i915_drm_client_name(ctx->client));
+	strncpy(e->comm, i915_drm_client_name(ctx->client), sizeof(e->comm) - 1);
+		e->comm[sizeof(e->comm) - 1] = '\0';
 	e->pid = pid_nr(i915_drm_client_pid(ctx->client));
 	e->uid = i915_drm_client_uid(ctx->client);
 
@@ -1681,7 +1684,8 @@ capture_vma(struct intel_engine_capture_vma *next,
 	    i915_vma_active_acquire_if_busy(vma))
 		c->pages = vma->pages;
 
-	strcpy(c->name, name);
+	strncpy(c->name, name, sizeof(c->name) - 1);
+		c->name[sizeof(c->name) - 1] = '\0';
 	c->vma = vma; /* reference held while active */
 
 	c->next = next;

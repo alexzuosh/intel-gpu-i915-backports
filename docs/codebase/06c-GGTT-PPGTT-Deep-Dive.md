@@ -982,6 +982,358 @@ ggtt_unmap(vram_frames);
 
 ---
 
+## Deep Dive: GGTT-PPGTT Interaction
+
+### Address Translation Pipeline with Both Tables
+
+```plantuml
+@startuml
+title GPU Address Translation: GGTT vs PPGTT Selection
+
+participant "GPU Instruction" as instr
+participant "Context Manager" as ctx_mgr
+participant "TLB" as tlb
+participant "GGTT Selector" as ggtt_sel
+participant "PPGTT Selector" as ppgtt_sel
+participant "Memory" as mem
+
+== Address Translation Flow ==
+
+instr -> ctx_mgr: GPU executes instruction\nload/store at VA 0x12345
+
+ctx_mgr -> ctx_mgr: Check: Is this address\nGGTT or PPGTT?
+
+alt Firmware/Kernel Operation
+  ctx_mgr -> ggtt_sel: GGTT address\n(firmware data, status page)
+  
+  ggtt_sel -> tlb: Lookup 0x12345 in TLB\n(tagged GGTT)
+  
+  alt TLB Hit
+    tlb -> mem: Fast translate\nVA→PA (direct)
+  else TLB Miss
+    ggtt_sel -> ggtt_sel: Walk GGTT tables\n(shallow, 2-level)
+    
+    ggtt_sel -> tlb: Insert mapping\ninto TLB
+    
+    ggtt_sel -> mem: Access physical memory
+  end
+  
+else Normal GPU Context Operation
+  ctx_mgr -> ppgtt_sel: PPGTT address\n(app memory, buffers)
+  
+  ppgtt_sel -> tlb: Lookup 0x12345 in TLB\n(tagged with context ID)
+  
+  alt TLB Hit
+    tlb -> mem: Fast translate\nVA→PA (direct)
+  else TLB Miss
+    ppgtt_sel -> ppgtt_sel: Walk PPGTT tables\n(deep, 4-level hierarchy)
+    
+    ppgtt_sel -> tlb: Insert mapping\ninto TLB with ASID
+    
+    ppgtt_sel -> mem: Access physical memory
+  end
+end
+
+@enduml
+```
+
+### Page Table Structure Comparison
+
+```plantuml
+@startuml
+title GGTT vs PPGTT: Page Table Hierarchy
+
+rectangle "GGTT\n(2-Level Hierarchy)" {
+  rectangle "GGTT PDE\n(Page Directory Entry)\nFlat directory" {
+    state "Entry 0→Frame100" as ggtt_pde0
+    state "Entry 1→Frame101" as ggtt_pde1
+    state "..." as ggtt_pde_dots
+  }
+  
+  rectangle "GGTT Physical Frames\n(Direct mapping)" {
+    state "Frame 100" as ggtt_f100
+    state "Frame 101" as ggtt_f101
+  }
+  
+  note right of ggtt_f100
+  Each entry directly
+  maps to physical page
+  fast lookup
+  end note
+}
+
+rectangle "PPGTT\n(4-Level Hierarchy)" {
+  rectangle "PML4\n(Page Map Level 4)" {
+    state "Entry 0→PDP addr" as pml4_e0
+  }
+  
+  rectangle "PDP\n(Page Directory Pointer)" {
+    state "Entry 0→PD addr" as pdp_e0
+  }
+  
+  rectangle "PD\n(Page Directory)" {
+    state "Entry 0→PT addr" as pd_e0
+  }
+  
+  rectangle "PT\n(Page Table)" {
+    state "Entry 0→Frame500" as pt_e0
+    state "Entry 1→Frame501" as pt_e1
+  }
+  
+  note right of pt_e1
+  Deep hierarchy but
+  very fine control
+  and large address space
+  end note
+}
+
+ggtt_pde0 --> ggtt_f100
+pml4_e0 --> pdp_e0: Follow pointer
+pdp_e0 --> pd_e0: Follow pointer
+pd_e0 --> pt_e0: Follow pointer
+pt_e0 --> pt_e0: VA→PA mapping
+
+@enduml
+```
+
+### Context Switching: GGTT Stable, PPGTT Changes
+
+```plantuml
+@startuml
+title GPU Context Switch: Register Updates
+
+participant "GPU Scheduler" as sched
+participant "GPU HW Registers" as hw_regs
+participant "Context A" as ctx_a
+participant "Context B" as ctx_b
+participant "GGTT\n(always same)" as ggtt
+participant "PPGTT A" as ppgtt_a
+participant "PPGTT B" as ppgtt_b
+
+== Context A Running ==
+
+ctx_a -> hw_regs: PPGTT_BASE = 0x123456\n(Context A's PPGTT base)
+
+ctx_a -> hw_regs: GGTT_BASE = 0x0\n(global, never changes)
+
+ctx_a -> ggtt: Access shared resources\nvia GGTT (firmware status page)
+
+ctx_a -> ppgtt_a: Access app memory\nvia PPGTT A
+
+== GPU Idle: Time to Switch to Context B ==
+
+sched -> hw_regs: Wait for GPU flush\n(context A completes)
+
+sched -> hw_regs: Save Context A LRC\n(state backup)
+
+sched -> hw_regs: Update PPGTT_BASE\n(THIS IS KEY)
+
+hw_regs -> hw_regs: PPGTT_BASE = 0x654321\n(Context B's PPGTT base)
+
+note right of hw_regs
+GGTT_BASE unchanged!
+(still 0x0)
+end note
+
+sched -> hw_regs: Load Context B LRC\n(state restore)
+
+== Context B Running ==
+
+ctx_b -> hw_regs: Runs with:\nPPGTT_BASE = 0x654321\nGGTT_BASE = 0x0
+
+ctx_b -> ggtt: Same GGTT mappings\n(firmware still visible)
+
+ctx_b -> ppgtt_b: Different PPGTT!\n(Context B memory)
+
+note bottom
+GGTT provides continuity
+PPGTT provides isolation
+end note
+
+@enduml
+```
+
+### Memory Protection: Isolation Enforcement
+
+```plantuml
+@startuml
+title PPGTT Isolation: Hardware Enforcement
+
+participant "App A" as app_a
+participant "GPU HW\n(VA Translator)" as gpu_hw
+participant "PPGTT A" as ppgtt_a
+participant "PPGTT B" as ppgtt_b
+participant "App B\nMemory" as app_b_mem
+
+== Legitimate Access ==
+
+app_a -> gpu_hw: load VA 0x5000\n(in App A's space)
+
+gpu_hw -> ppgtt_a: Translate 0x5000\nusing PPGTT A
+
+ppgtt_a -> gpu_hw: PA 0xF0001000\n(App A's data)
+
+gpu_hw -> gpu_hw: Return data from\nPhysical address
+
+app_a -> app_a: Got correct data\n(in App A's buffer)
+
+== Attempted Malicious Access ==
+
+app_a -> gpu_hw: Somehow get\nApp B's context ID
+
+app_a -> gpu_hw: Try to load VA 0x5000\nwith App B's context
+
+alt GPU Enforces Context
+  gpu_hw -> ppgtt_b: Check permission:\nCan App A use\nApp B's PPGTT?
+  
+  ppgtt_b -> ppgtt_b: NO! Hardware check:\n"Current context ≠ B"
+  
+  ppgtt_b -> gpu_hw: Access Denied\n(exception)
+  
+else Can't Forge Context
+  gpu_hw -> gpu_hw: Current context ID\nstored in HW register\ncannot be modified\nfrom GPU code
+end
+
+note bottom of gpu_hw
+Hardware protection:
+context ID cannot be
+forged from user GPU code
+PPGTT base is privileged
+only kernel can update
+end note
+
+@enduml
+```
+
+### Eviction Flow: Both Tables Involved
+
+```plantuml
+@startuml
+title Memory Pressure: Eviction Updates Both Tables
+
+participant "Memory Pressure" as mp
+participant "Shrinker" as shrink
+participant "Eviction Engine" as evict
+participant "GGTT" as ggtt_table
+participant "PPGTT" as ppgtt_table
+participant "Object" as obj
+
+== High Memory Pressure Detected ==
+
+mp -> shrink: System RAM: 95%\nreclaim 512MB
+
+shrink -> shrink: Scan objects\nfor eviction targets
+
+shrink -> obj: Eviction candidate:\nGEM object (in PPGTT)
+
+== Decide Target and Prepare ==
+
+evict -> obj: Is object mapped\nin GGTT?
+
+alt Object also in GGTT
+  evict -> ggtt_table: Unmap from GGTT\n(invalidate GGTT PTE)
+  
+  ggtt_table -> ggtt_table: GGTT entry = 0\n(unmapped)
+  
+else Object only in PPGTT
+  evict -> evict: Only need to update\nPPGTT
+end
+
+== Execute Eviction ==
+
+evict -> ppgtt_table: Unmap from PPGTT\n(invalidate PPGTT PTE)
+
+ppgtt_table -> ppgtt_table: Set PTE flags:\nPAGE_NOT_PRESENT
+
+ppgtt_table -> ppgtt_table: Update dirty bit\nin page table
+
+evict -> evict: Trigger TLB shootdown\nfor all CPUs
+
+evict -> obj: Move object to disk\nor alternate region
+
+obj -> obj: Object now on disk\nor in slower memory
+
+== App Tries to Access ==
+
+obj -> gpu_hw: GPU tries load\nfrom evicted VA
+
+gpu_hw -> ppgtt_table: Walk PPGTT\nfind PAGE_NOT_PRESENT
+
+ppgtt_table -> gpu_hw: Return fault\n(page fault exception)
+
+gpu_hw -> evict: Exception: PAGE_FAULT\n(evicted address)
+
+evict -> obj: Restore object\nfrom disk/slow memory
+
+obj -> ppgtt_table: Update PPGTT PTE\nwith new address
+
+ppgtt_table -> gpu_hw: Retry instruction\n(now succeeds)
+
+@enduml
+```
+
+### TLB Invalidation: Cross-Table Considerations
+
+```plantuml
+@startuml
+title TLB Invalidation: Maintaining Coherency
+
+participant "Driver" as driver
+participant "GGTT" as ggtt
+participant "PPGTT" as ppgtt
+participant "TLB\n(tagged)" as tlb
+participant "GPU Pipeline" as pipe
+
+== Scenario: GGTT Entry Updated ==
+
+driver -> ggtt: Update GGTT PTE\n(firmware data changes)
+
+ggtt -> ggtt: Mark TLB entry\ninvalid (for GGTT)
+
+note right of ggtt
+TLB tagged with:
+• ASID (context ID) or
+• Table ID (GGTT vs PPGTT)
+So we can selectively flush
+end note
+
+ggtt -> tlb: Invalidate all TLB\nentries tagged GGTT
+
+tlb -> tlb: Remove entries:\n• GGTT-tagged VA→PA
+
+== Scenario: PPGTT Entry Updated ==
+
+driver -> ppgtt: Update PPGTT PTE\n(context A buffer moves)
+
+ppgtt -> ppgtt: Mark TLB entries\ninvalid (for context A)
+
+ppgtt -> tlb: Invalidate TLB\nentries tagged:\nASID=Context_A
+
+tlb -> tlb: Remove entries:\n• Context A VA→PA\nmappings only
+
+note right of tlb
+Context B TLB entries
+remain (tagged ASID=B)
+No interference
+end note
+
+== GPU Pipeline Impact ==
+
+pipe -> tlb: All future VA translations\nfor Context A: TLB miss
+
+pipe -> ppgtt: Walk PPGTT table\n(until TLB repopulates)
+
+note bottom of pipe
+Performance: TLB miss penalty
+temporary until refill
+then fast again
+end note
+
+@enduml
+```
+
+---
+
 ## Advanced Scenarios
 
 ### Scenario 1: Shared Memory Between Contexts

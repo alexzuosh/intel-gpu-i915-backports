@@ -54,7 +54,7 @@ struct i915_vma *i915_vma_alloc(gfp_t gfp)
 
 void i915_vma_free(struct i915_vma *vma)
 {
-	return kmem_cache_free(slab_vmas, vma);
+	kmem_cache_free(slab_vmas, vma);
 }
 
 #if IS_ENABLED(CPTCFG_DRM_I915_ERRLOG_GEM) && IS_ENABLED(CPTCFG_DRM_DEBUG_MM)

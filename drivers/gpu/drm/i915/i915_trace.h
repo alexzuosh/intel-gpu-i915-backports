@@ -899,8 +899,10 @@ TRACE_EVENT(i915_gem_object_migrate,
 			   __entry->dev = obj->base.dev->primary->index;
 			   __entry->obj = obj;
 			   __entry->size = obj->base.size;
-			   strcpy(__entry->src, obj->mm.region.mem->name);
-			   strcpy(__entry->dst, region->name);
+			   strncpy(__entry->src, obj->mm.region.mem->name, sizeof(__entry->src) - 1);
+			   __entry->src[sizeof(__entry->src) - 1] = '\0';
+			   strncpy(__entry->dst, region->name, sizeof(__entry->dst) - 1);
+			   __entry->dst[sizeof(__entry->dst) - 1] = '\0';
 			   __entry->has_pages = i915_gem_object_has_pages(obj);
 			   ),
 
@@ -941,7 +943,8 @@ TRACE_EVENT(i915_mm_fault,
 			   if (vma) {
 				   __entry->obj = vma->obj;
 				   __entry->obj_size = vma->obj->base.size;
-				   strcpy(__entry->region, vma->obj->mm.region.mem->name);
+				   strncpy(__entry->region, vma->obj->mm.region.mem->name, sizeof(__entry->region) - 1);
+				   __entry->region[sizeof(__entry->region) - 1] = '\0';
 				   __entry->vma_size = i915_vma_size(vma);
 				   __entry->is_bound = i915_vma_is_bound(vma, PIN_USER);
 			   } else {
@@ -949,7 +952,8 @@ TRACE_EVENT(i915_mm_fault,
 				   __entry->obj_size = 0;
 				   __entry->vma_size = 0;
 				   __entry->is_bound = false;
-				   strcpy(__entry->region, "none");
+				   strncpy(__entry->region, "none", sizeof(__entry->region) - 1);
+				   __entry->region[sizeof(__entry->region) - 1] = '\0';
 			   }
 			   __entry->addr = info->page_addr;
 			   __entry->asid = info->asid;
@@ -1049,7 +1053,8 @@ TRACE_EVENT(i915_vm_prefetch,
 			   __entry->vm_id = vm_id;
 			   __entry->start = start;
 			   __entry->len = len;
-			   strcpy(__entry->region, region->name);
+			   strncpy(__entry->region, region->name, sizeof(__entry->region) - 1);
+			   __entry->region[sizeof(__entry->region) - 1] = '\0';
 			   ),
 
 	    TP_printk("dev %d prefetch va start %llx (len %llx) to region %s for vm %d",

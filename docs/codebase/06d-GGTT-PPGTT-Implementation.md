@@ -698,6 +698,300 @@ int migrate_object_to_vram(struct drm_i915_gem_object *obj,
 
 ---
 
+## Deep Dive: Implementation Patterns
+
+### VMA Binding State Machine
+
+```plantuml
+@startuml
+title Virtual Memory Address (VMA): Binding Lifecycle State Machine
+
+state "Created" as st_created {
+  [*] --> vma_create: alloc VMA struct\nobj + vm specified
+  vma_create --> [*]
+}
+
+state "Unbound" as st_unbound {
+  [*] --> idle: VMA exists\nbut not in any\npage table
+  idle --> [*]
+}
+
+state "Binding" as st_binding {
+  [*] --> bind_start: i915_vma_pin() called
+  bind_start --> decide: Where to bind?\nGGTT or PPGTT?
+  
+  decide --> ggtt_bind: If GGTT:\nadd to GGTT\npage table
+  ggtt_bind --> flags_set: Set flags:\nBOUND_GGTT
+  
+  decide --> ppgtt_bind: If PPGTT:\nadd to PPGTT\npage table
+  ppgtt_bind --> flags_set: Set flags:\nBOUND_PPGTT
+  
+  flags_set --> [*]
+}
+
+state "Bound" as st_bound {
+  [*] --> active: VMA appears in\npage table\nVA↔PA mapping\nactive
+  active --> [*]
+}
+
+state "Unbinding" as st_unbinding {
+  [*] --> unpin_start: i915_vma_unpin() called
+  unpin_start --> remove: Remove from\npage tables
+  remove --> flags_clear: Clear binding\nflags
+  flags_clear --> [*]
+}
+
+state "Freed" as st_freed {
+  [*] --> cleanup: Free VMA struct\nand resources
+  cleanup --> [*]
+}
+
+[*] --> st_created
+st_created --> st_unbound
+st_unbound --> st_binding: pin()
+st_binding --> st_bound
+st_bound --> st_unbinding: unpin()
+st_unbinding --> st_unbound
+st_unbound --> st_freed: destroy()
+
+note right of st_bound
+In this state:
+GPU can access
+this address
+through page table
+end note
+
+@enduml
+```
+
+### GGTT Pinning Operation: Detailed Flow
+
+```plantuml
+@startuml
+title GGTT Pinning: Step-by-Step Mapping
+
+participant "i915_vma_pin()" as vma_pin
+participant "GGTT Allocator" as ggtt_alloc
+participant "GGTT Page Table" as ggtt_pt
+participant "TLB" as tlb
+participant "GPU" as gpu
+
+== Prepare ==
+
+vma_pin -> vma_pin: Check: Already pinned?\n(cached in VMA)
+
+alt Already Pinned
+  vma_pin -> vma_pin: Just increment ref count\nreturn quickly
+else Not Yet Pinned
+  vma_pin -> ggtt_alloc: Allocate space in GGTT\n(need N frames)
+end
+
+== Allocate Space ==
+
+ggtt_alloc -> ggtt_alloc: Search free list\nfor contiguous space
+
+ggtt_alloc -> ggtt_alloc: Space found at\nGGTT offset: 0x1000
+
+ggtt_alloc -> ggtt_alloc: Mark as in-use\n(update allocator state)
+
+== Create Mappings ==
+
+vma_pin -> ggtt_pt: For each physical frame\n(0-N):
+
+ggtt_pt -> ggtt_pt: Write GGTT PTE:\nGGTT_OFFSET[i] = \nPhysical_Frame
+
+ggtt_pt -> ggtt_pt: Set flags:\nVALID=1\nCACHE=WB\n(all per-platform)
+
+== Flush ==
+
+vma_pin -> tlb: Invalidate any old\nTLB entries\n(just added to GGTT)
+
+tlb -> tlb: Clear TLB\nfor these GGT addresses
+
+== Notify Object ==
+
+vma_pin -> vma_pin: Update VMA flags:\nflags |= BOUND_GGTT
+
+vma_pin -> vma_pin: Store GGTT offset:\nvma->ggtt_offset = \n0x1000
+
+== GPU Ready ==
+
+gpu -> gpu: GPU can now\naccess this object\nvia GGTT addresses\n0x1000 onwards
+
+@enduml
+```
+
+### PPGTT Binding: Per-Context Isolation
+
+```plantuml
+@startuml
+title PPGTT Binding: Per-Context Page Table Updates
+
+participant "Context A" as ctx_a
+participant "PPGTT A\n(4-level)" as ppgtt_a
+participant "Context B" as ctx_b
+participant "PPGTT B\n(4-level)" as ppgtt_b
+participant "GPU Pipeline" as gpu
+
+== Scenario: Same Object in Two Contexts ==
+
+ctx_a -> ppgtt_a: Bind object to Context A\ni915_vma_pin(vma, a)
+
+ppgtt_a -> ppgtt_a: Walk page table\n4 levels deep:\nPML4→PDP→PD→PT
+
+ppgtt_a -> ppgtt_a: Insert PTE at leaf:\nPT[256] = physical_frame
+
+ppgtt_a -> ppgtt_a: Mark VALID\nCache policy\nAccess rights (RW)
+
+ctx_a -> gpu: Context A can now\naccess object\nat VA 0x1000 (example)
+
+== Completely Separate Binding ==
+
+ctx_b -> ppgtt_b: Different context\nbind same object\ni915_vma_pin(vma, b)
+
+ppgtt_b -> ppgtt_b: Different PPGTT tree!\nWalk PPGTT B separately
+
+ppgtt_b -> ppgtt_b: Insert PTE in PPGTT B\nat potentially different\nVirtual address
+
+ppgtt_b -> ppgtt_b: Same physical frame\nbut different VA!
+
+note right of ppgtt_b
+Object bound at:
+• VA 0x1000 in Context A
+• VA 0x5000 in Context B
+(or any other VA)
+• Same physical frame
+• Complete isolation
+end note
+
+ctx_b -> gpu: Context B can access\nfrom its own VA
+
+== Key Benefit ==
+
+gpu -> gpu: Context A and B\ncan run in parallel:\n• Core 0: Context A\n  accesses 0x1000\n• Core 1: Context B\n  accesses 0x5000\n• No conflicts\n• No interference
+
+@enduml
+```
+
+### i915_vma Structure and Operations
+
+```plantuml
+@startuml
+title i915_vma: Virtual Address Descriptor
+
+rectangle "i915_vma Structure" {
+  database "Ownership" as own {
+    state "VM Pointer\n(which address space)" as own_vm
+    state "Object Pointer\n(what's mapped)" as own_obj
+  }
+  
+  database "Binding State" as bind_state {
+    state "Flags:\nBOUND_GGTT\nBOUND_PPGTT" as flags
+    state "Offset:\nGGTT offset or\nPPGTT VA" as offset
+  }
+  
+  database "Pin State" as pin_state {
+    state "Pin count\n(reference counting)" as pin_cnt
+    state "Page table level" as pt_level
+  }
+  
+  database "List Management" as lists {
+    state "On obj_vma_list\n(all VMAs for object)" as obj_list
+    state "On vm_bound_list\n(all bound VMAs)" as vm_list
+  }
+  
+  database "Constraints" as constraints {
+    state "Cache policy" as cache
+    state "Access rights\n(RW, RO)" as access
+  }
+}
+
+note right of own_vm
+Determines if GGTT
+or PPGTT binding
+end note
+
+note right of pin_state
+ref count prevents
+premature unmapping
+end note
+
+note right of constraints
+Set during binding
+enforced by GPU HW
+end note
+
+@enduml
+```
+
+### Error Handling: Binding Failures
+
+```plantuml
+@startuml
+title VMA Binding: Error Scenarios
+
+participant "i915_vma_pin()" as pin_call
+participant "Allocator" as alloc
+participant "Error Handler" as err_handler
+participant "Callback" as callback
+
+== Normal Success ==
+
+pin_call -> alloc: Allocate space
+
+alt Space Available
+  alloc -> pin_call: SUCCESS\nreturn 0
+end
+
+== GGTT Out of Space ==
+
+pin_call -> alloc: Need 512MB for object
+
+alt GGTT Full (256MB total)
+  alloc -> err_handler: -ENOSPC\n(no space)
+  
+  err_handler -> callback: Trigger eviction\nof idle objects
+  
+  callback -> callback: Evict LRU object\n256MB freed
+  
+  pin_call -> alloc: Retry allocation\nafter eviction
+  
+  alt Now Has Space
+    alloc -> pin_call: SUCCESS
+  end
+end
+
+== PPGTT Page Allocation Fails ==
+
+pin_call -> alloc: Allocate PPGTT\npage tables
+
+alt OOM (No Memory)
+  alloc -> err_handler: -ENOMEM\nkalloc failed
+  
+  err_handler -> pin_call: Return error\nto caller
+  
+  callback -> callback: Caller should\nhandle: cleanup\nretry or fail\nend note on callback
+
+== Invalid Parameters ==
+
+pin_call -> pin_call: Sanity checks:\nVMA valid?\nObject exists?\nVM accessible?
+
+alt Check Fails
+  pin_call -> err_handler: -EINVAL\nbad parameter
+  
+  err_handler -> pin_call: Return error
+  
+  note right of err_handler
+  Prevents memory corruption
+  from invalid bindings
+  end note
+end
+
+@enduml
+```
+
+---
+
 ## Real-World Examples
 
 ### Example 1: Display Framebuffer Setup

@@ -1071,6 +1071,493 @@ enum i915_cache_level {
 
 ---
 
+## Deep Dive: Virtual Memory Architecture & Translation
+
+### Complete Address Translation Pipeline
+
+```plantuml
+@startuml
+title Complete GPU Address Translation: VA to PA
+
+participant "GPU Batch" as batch
+participant "GPU Engine" as engine
+participant "GPU MMU\n(Memory Mgmt Unit)" as mmu
+participant "TLB\n(Translation Lookaside)" as tlb
+participant "Page Table" as pt
+participant "Physical Memory" as phys
+
+== Batch Execution ==
+
+batch -> engine: GPU command with\nGPU Virtual Address (VA)
+
+engine -> engine: GPU execution unit\nneeds memory access
+
+== Address Translation ==
+
+engine -> mmu: Request translation\nVA = 0x12345000
+
+mmu -> tlb: Check TLB cache\nfor VA translation
+
+alt TLB Hit
+  tlb -> tlb: Found entry in TLB\nVA -> PA mapping
+  
+  tlb -> mmu: Return PA immediately\n(fast path, ~1ns)
+  
+else TLB Miss
+  tlb -> pt: Walk page table\nhierarchy
+  
+  pt -> pt: Level 1 table (PML4)\nindex = VA[48:39]
+  
+  pt -> pt: Level 2 table (PDPE)\nindex = VA[38:30]
+  
+  pt -> pt: Level 3 table (PDE)\nindex = VA[29:21]
+  
+  pt -> pt: Level 4 table (PTE)\nindex = VA[20:12]
+  
+  pt -> pt: PTE entry contains:\nPhysical address (PA)\nPermission bits\nCache control
+  
+  pt -> mmu: Return PA from PTE
+  
+  mmu -> tlb: Cache this mapping\nin TLB for future hits
+  
+  tlb -> mmu: Return PA (~100-200ns)
+end
+
+== Physical Access ==
+
+mmu -> phys: Send physical address\nto memory controller
+
+phys -> phys: Access physical memory\nat returned address
+
+phys -> engine: Return data\nto GPU engine
+
+@enduml
+```
+
+### Page Table Hierarchy: 4-Level Structure
+
+```plantuml
+@startuml
+title GPU Page Table Hierarchy: 4-Level (48-bit VA)
+
+rectangle "Virtual Address Bits\n[47:0] = 48-bit VA" {
+  database "[47:39] = 9 bits\nPML4 index" as l1_bits
+  database "[38:30] = 9 bits\nPDPT index" as l2_bits
+  database "[29:21] = 9 bits\nPD index" as l3_bits
+  database "[20:12] = 9 bits\nPT index" as l4_bits
+  database "[11:0] = 12 bits\nPage offset" as offset
+}
+
+rectangle "Page Table Structures\n(each 4KB page)" {
+  rectangle "Level 1: PML4" as pml4 {
+    database "512 entries (8 bytes each)\nEach points to PDPT" as pml4_entry
+  }
+  
+  rectangle "Level 2: PDPT" as pdpt {
+    database "512 entries\nEach points to PD" as pdpt_entry
+  }
+  
+  rectangle "Level 3: PD" as pd {
+    database "512 entries\nEach points to PT" as pd_entry
+  }
+  
+  rectangle "Level 4: PT" as pt {
+    database "512 entries\nEach points to physical page" as pt_entry
+  }
+}
+
+rectangle "Physical Memory" as phys {
+  database "4KB Page\n[11:0] offset into page" as page
+}
+
+l1_bits --> pml4_entry: index into
+pml4_entry --> pdpt_entry: points to
+
+l2_bits --> pdpt_entry: index into
+pdpt_entry --> pd_entry: points to
+
+l3_bits --> pd_entry: index into
+pd_entry --> pt_entry: points to
+
+l4_bits --> pt_entry: index into
+pt_entry --> page: points to
+
+offset --> page: offset within
+
+note right of pml4
+Top-level table
+always in GPU memory
+end note
+
+note right of ptentry
+PTE entry format:
+[63:12] = PA
+[11:5] = flags
+[4:0] = perms
+end note
+
+@enduml
+```
+
+### GGTT vs PPGTT: Address Space Isolation
+
+```plantuml
+@startuml
+title GGTT vs PPGTT: Global vs Per-Process Address Spaces
+
+rectangle "GPU Global Address Space\n(GGTT)" {
+  database "GGTT Page Tables\n(Shared by all contexts)" as ggtt_pt
+  
+  database "Context A\nshared buffer" as ggtt_ctx_a
+  database "Context B\nshared buffer" as ggtt_ctx_b
+  database "Kernel\ndisplay buffer" as ggtt_kern
+}
+
+rectangle "Context A Private\nAddress Space (PPGTT)" {
+  database "PPGTT_A Page Tables\n(Private to context A)" as ppgtt_a_pt
+  
+  database "App A Data\n(only visible to A)" as ppgtt_a_data
+  database "App A Code\n(only visible to A)" as ppgtt_a_code
+}
+
+rectangle "Context B Private\nAddress Space (PPGTT)" {
+  database "PPGTT_B Page Tables\n(Private to context B)" as ppgtt_b_pt
+  
+  database "App B Data\n(only visible to B)" as ppgtt_b_data
+  database "App B Code\n(only visible to B)" as ppgtt_b_code
+}
+
+ggtt_ctx_a --> ggtt_pt
+ggtt_ctx_b --> ggtt_pt
+ggtt_kern --> ggtt_pt
+
+ppgtt_a_data --> ppgtt_a_pt
+ppgtt_a_code --> ppgtt_a_pt
+
+ppgtt_b_data --> ppgtt_b_pt
+ppgtt_b_code --> ppgtt_b_pt
+
+note right of ggpt
+GGTT visible to
+all contexts
+Used for:
+- Display surfaces
+- Shared resources
+- Kernel objects
+end note
+
+note right of ppgtt_a_pt
+PPGTT_A only loaded
+when context A runs
+Provides isolation:
+- App A cannot see B's data
+- Prevents interference
+end note
+
+@enduml
+```
+
+### VMA Binding Lifecycle
+
+```plantuml
+@startuml
+title VMA Binding: From Creation to Unbinding
+
+participant "User App" as app
+participant "GEM Object" as gem
+participant "Address Space" as vm
+participant "Page Tables" as pt
+participant "GPU Engine" as gpu
+
+== VMA Creation ==
+
+app -> gem: Create GEM object\n(4MB buffer)
+
+gem -> vm: i915_vma_create(gem, ppgtt_a)\nCreate VMA binding
+
+vm -> vm: Allocate virtual address\nrange in PPGTT_A\nVA = [0x12340000:0x12341000]
+
+vm -> gem: Link VMA to GEM object
+
+== VMA Pinning (First Use) ==
+
+app -> app: Submit batch\nreferencing object
+
+gem -> pt: i915_vma_pin()\nPhysically bind VMA
+
+pt -> pt: Walk page table\nhierarchy
+
+pt -> pt: Allocate intermediate\npage tables if needed
+
+pt -> pt: Update PTEs:\nVA[0x1234xxxx] -> PA[0xf0000000+offset]
+
+pt -> pt: Set cache control bits\n(write-back, coherent, etc)
+
+pt -> pt: Flush TLB\ni915_tlb_invalidate()\nInvalidate translations
+
+== GPU Access ==
+
+gpu -> gpu: Batch executes\naccesses object at VA
+
+gpu -> gpu: GPU MMU translates\nVA -> PA using PTEs
+
+gpu -> gpu: Access physical memory
+
+== VMA Unpinning ==
+
+app -> app: No more accesses
+
+gem -> pt: i915_vma_unpin()\nRelease VMA binding
+
+pt -> pt: Clear PTEs for\nthis VMA's VA range
+
+pt -> pt: TLB invalidate\nto clear stale entries
+
+== VMA Destruction ==
+
+app -> gem: gem_close()\nRelease object
+
+gem -> vm: i915_vma_destroy()\nRemove VMA
+
+vm -> vm: Free virtual address\nrange back to allocator
+
+vm -> gem: VMA unlinked
+
+gem -> gem: GEM object freed\nif no more VMAs
+
+@enduml
+```
+
+### TLB Invalidation & Cache Coherency
+
+```plantuml
+@startuml
+title TLB Invalidation & Cache Coherency
+
+participant "Driver" as drv
+participant "Page Tables" as pt
+participant "GPU TLB" as tlb
+participant "GPU Cache" as cache
+participant "Memory" as mem
+
+== Page Table Update ==
+
+drv -> pt: Update PTE\nChange VA->PA mapping
+
+drv -> drv: Reason: migrating object\nto different physical page
+
+== TLB Flush (Invalidation) ==
+
+drv -> tlb: i915_tlb_invalidate()\nFlush specific VA range
+
+tlb -> tlb: Invalidate all\nTLB entries for this range
+
+note right of tlb
+If NOT invalidated:
+- GPU will use stale\n  VA->PA mapping\n- Wrong physical page\n- Data corruption!
+end note
+
+== Cache Flush (if needed) ==
+
+drv -> cache: i915_cache_flush()\nFlush specific cache lines
+
+cache -> cache: Write back dirty lines\nfor this VA range
+
+cache -> mem: Flush to memory
+
+note right of cache
+If NOT flushed:
+- Old data still in cache\n- GPU reads old values\n- CPU writes new values\n- Coherency broken!
+end note
+
+== Resume Operation ==
+
+tlb -> tlb: Fresh TLB entries\ncreated on next access
+
+cache -> cache: Cache lines refilled\nfrom memory
+
+drv -> drv: Safe to use updated\npage tables
+
+@enduml
+```
+
+### Address Space Allocation & Fragmentation
+
+```plantuml
+@startuml
+title Address Space Allocation: VA Range Management
+
+rectangle "Virtual Address Space\n(48-bit = 256TB)" {
+  database "[0x000000000000:0x000100000000]\nKernel/Reserved\n(1MB)" as kern
+  
+  database "[0x000100000000:0x100000000000]\nUser PPGTT\n(~256TB)" as user
+  
+  database "[0xFFFF00000000:0xFFFFFFFFFFFF]\nHigher mapping\n(1MB)" as high
+}
+
+rectangle "Allocated Buffers in User Space" {
+  database "App A Heap\n[0x000100000000:0x000101000000]\n(16MB)" as heap_a
+  
+  database "Texture Buffer\n[0x000101000000:0x000102000000]\n(16MB)" as tex
+  
+  database "App B Stack\n[0x000102000000:0x000102100000]\n(1MB)" as stack_b
+  
+  database "Free Space\n[0x000102100000:...]\n(rest)" as free
+}
+
+note right of kern
+Kernel objects
+always available
+to all contexts
+end note
+
+note right of user
+Per-process space
+isolated by PPGTT
+allocated on demand
+end note
+
+note right of heap_a
+Allocation in virtual
+space does NOT allocate
+physical memory yet
+Physical pages allocated
+on first access
+end note
+
+note right of free
+Remaining virtual space
+available for future
+allocations
+Fragmentation rare due
+to virtual address space
+size
+end note
+
+@enduml
+```
+
+### TLB Architecture & Hit Rates
+
+```plantuml
+@startuml
+title GPU TLB: Architecture & Performance Impact
+
+rectangle "TLB Levels" {
+  rectangle "L1 TLB\n(per-core)" {
+    database "8-16 entries\n~4-5ns access\nper-execution unit" as l1_tlb
+  }
+  
+  rectangle "L2 TLB\n(shared)" {
+    database "256-512 entries\n~20-30ns access\nshared by cores" as l2_tlb
+  }
+  
+  rectangle "Page Table Walk\n(on miss)" {
+    database "4-level hierarchy walk\n~100-200ns\naccesses memory" as pt_walk
+  }
+}
+
+rectangle "TLB Performance\n(Example: 48-entry L1)" {
+  database "Hit Rate: 99% (common)\nEffective latency: ~5ns" as hit_perf
+  database "Miss Rate: 1%\nPageTable walk: ~150ns\nAvg: 5ns * 0.99 + 150ns * 0.01 = 6.5ns" as miss_perf
+}
+
+l1_tlb -.-> l2_tlb: L1 miss
+l2_tlb -.-> pt_walk: L2 miss
+
+note right of l1_tlb
+Per-core/execution unit
+Fast but small
+Limited entries
+end note
+
+note right of l2_tlb
+Shared by all cores
+Larger capacity
+Slower than L1
+end note
+
+note right of pt_walk
+Slowest path
+Requires memory access
+Each level needs lookup
+Stalls GPU execution
+end note
+
+@enduml
+```
+
+### VMA Migration: Moving Objects Between Regions
+
+```plantuml
+@startuml
+title VMA Migration: Object Movement Between Memory Regions
+
+participant "Object" as obj
+participant "Source Region\n(VRAM)" as src
+participant "Destination Region\n(System Memory)" as dst
+participant "Page Tables" as pt
+participant "GPU" as gpu
+
+== Pre-Migration State ==
+
+src -> obj: Object in VRAM\nVA mapped to VRAM PA
+
+src -> gpu: GPU accessing\nfrom VRAM
+
+== Migration Trigger ==
+
+obj -> obj: Memory pressure\nEVICT_OBJECT signal
+
+obj -> src: Unbind from source\nVA not yet mapped
+
+src -> src: Object data still\nin VRAM
+
+== Data Copy ==
+
+src -> dst: Copy object data\nfrom VRAM to System Memory
+
+note right of dst
+Can use:
+- GPU copy DMA\n(fast ~100GB/s)\n- CPU copy\n(slower ~20GB/s)\n- memcpy
+end note
+
+== Rebind to New Location ==
+
+obj -> pt: Bind to destination\nUpdate PTEs
+
+pt -> pt: PTEs now point to\nSystem Memory pages
+
+pt -> pt: TLB invalidate\nclear old mappings
+
+== Post-Migration State ==
+
+dst -> gpu: GPU accessing\nfrom System Memory
+
+gpu -> gpu: Performance degraded\nSystemMemory slower\nthan VRAM
+
+note right of gpu
+Trade-off:
+Freed up VRAM space
+but access latency
+increased
+end note
+
+== Later Re-migration ==
+
+gpu -> gpu: Object accessed frequently\nMemory pressure relieved
+
+obj -> dst: Evict from System Memory
+
+obj -> src: Promote back to VRAM
+
+src -> gpu: Fast access restored
+
+@enduml
+```
+
+---
+
 ## Debugging & Inspection
 
 ### Debugfs Commands:
