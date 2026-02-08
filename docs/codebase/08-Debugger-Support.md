@@ -482,6 +482,347 @@ GPU Hang with GuC Submission
 
 ---
 
+## Deep Dive: Debugging Workflows
+
+### GPU Hang Detection Flow
+
+```plantuml
+@startuml
+title GPU Hang Detection: Detection and Recovery
+
+participant "GPU Task" as gpu_task
+participant "Watchdog Timer" as watchdog
+participant "Hang Detector" as detector
+participant "Error Handler" as err_handler
+participant "Userspace" as userspace
+
+== Normal Execution ==
+
+gpu_task -> gpu_task: Execute batch buffer\nall looking good
+
+watchdog -> watchdog: Watchdog running\n(monitoring batch timeout)
+
+== Hang Detected ==
+
+gpu_task -> gpu_task: Batch stalls\nafter 2.5 seconds\n(no progress)
+
+watchdog -> watchdog: Timeout expired:\n2.5s with no\ncompletion
+
+watchdog -> detector: HANG DETECTED\nGPU not responding
+
+== Diagnosis ==
+
+detector -> detector: Sample GPU state:\n• PC (program counter)\n• Ring buffer head/tail\n• Context status\n• Engine state
+
+detector -> detector: Analyze:\nStuck in loop?\nDeadlock?\nMemory fault?
+
+alt Likely Recoverable
+  detector -> err_handler: Recovery attempt:\n• Reset GPU\n• Clean up context\n• Clear fences
+else Likely Hardware Issue
+  detector -> err_handler: Mark as fatal\nrequire full driver reload
+end
+
+== User Notification ==
+
+err_handler -> userspace: Send event:\n"GPU_HANG"\nwith context info
+
+userspace -> userspace: Crash dump generation\nDebugger dump collection\nUser notification
+
+@enduml
+```
+
+### Error Capture: From Hang to Coredump
+
+```plantuml
+@startuml
+title Error Capture: GPU Hang → Coredump Generation
+
+participant "GPU Engine" as engine
+participant "Hang Detector" as hang_det
+participant "Capture Engine" as capture
+participant "Coredump Buffer" as coredump
+participant "Userspace\n/proc" as proc
+
+== GPU Hang Occurred ==
+
+engine -> engine: Stalled\nno progress
+
+hang_det -> hang_det: Detected hang\nafter timeout
+
+== Immediate Capture ==
+
+hang_det -> capture: Trigger error capture:\ni915_gpu_error_state_alloc()
+
+capture -> capture: Allocate error_state\nstructure (2-3MB)
+
+== Capture Device State ==
+
+capture -> capture: Sample device:\n• PCI config\n• Driver version\n• System info\n• GPU capabilities
+
+== Capture Engine State ==
+
+capture -> capture: For each engine\n(RCS, BCS, VCS, VECS):\n• Ring position (HEAD/TAIL)\n• Instruction pointer\n• Engine status\n• Request queue
+
+== Capture Context State ==
+
+capture -> capture: For active context:\n• LRC (Logical Render Context)\n• Hang instruction\n• VM state\n• Registers\n• Scratch memory
+
+== Capture Batch Buffer ==
+
+capture -> capture: Dump batch buffer:\n• Around IP (instruction ptr)\n• Full batch + command stream\n• Help diagnose command
+
+== Compress & Store ==
+
+capture -> coredump: Store all captured data\nin kernel memory\n(error_state->coredump)
+
+coredump -> coredump: Compress if needed\nfor /proc/i915/error
+
+== Userspace Access ==
+
+userspace -> proc: cat /proc/i915/error\nor read via ioctl
+
+proc -> userspace: Provide error state\nfor analysis
+
+@enduml
+```
+
+### Breakpoint Architecture: Setting and Hit Detection
+
+```plantuml
+@startuml
+title Breakpoint Architecture: Userspace Debugging
+
+participant "Debugger" as debugger
+participant "i915 Driver" as driver
+participant "GPU HW" as gpu_hw
+participant "EU (Execution Unit)" as eu
+participant "Event FIFO" as event_fifo
+
+== Debugger Sets Breakpoint ==
+
+debugger -> driver: ioctl: SET_BREAKPOINT\n(context, VA)
+
+driver -> driver: Validate:\n• Context exists\n• VA is in code\n• Can pause EU
+
+driver -> gpu_hw: Program breakpoint:\n• EU attent interrupt\n• at address VA\n• for this context
+
+== GPU Executes, Hits Breakpoint ==
+
+gpu_hw -> eu: Execute instruction\nat VA (breakpoint addr)
+
+eu -> eu: EU detects:\nthis is breakpoint
+
+eu -> eu: Raise EU_ATTENTION\ninterrupt
+
+gpu_hw -> gpu_hw: Halt EU execution\n(pause at breakpoint)
+
+== Interrupt Handling ==
+
+gpu_hw -> driver: IRQ: EU_ATTENTION
+
+driver -> driver: Identify which EU\nwhich context\nwhich address
+
+driver -> event_fifo: Insert event:\n• TYPE: BREAKPOINT_HIT\n• context_id\n• address\n• EU state
+
+== Userspace Notification ==
+
+event_fifo -> debugger: Event available\nin event FIFO
+
+debugger -> debugger: Poll or eventfd\nwakes up
+
+debugger -> driver: Read event:\nBREAKPOINT_HIT\ndetails
+
+debugger -> debugger: Pause execution\nallow inspection:\n• Registers\n• Memory\n• Stack
+
+== Resume Execution ==
+
+debugger -> driver: ioctl: RESUME\n(context, single-step?)
+
+driver -> gpu_hw: Resume EU\nfrom breakpoint\n(or single-step)
+
+gpu_hw -> eu: Continue\nexecution
+
+@enduml
+```
+
+### Single-Stepping: Instruction-by-Instruction Execution
+
+```plantuml
+@startuml
+title Single-Stepping: Instruction-by-Instruction Debugging
+
+participant "Debugger" as debugger
+participant "GPU Driver" as driver
+participant "EU Control" as eu_ctrl
+participant "EU\n(Execution Unit)" as eu
+participant "Event Stream" as events
+
+== Enable Single-Step Mode ==
+
+debugger -> driver: ioctl: ENABLE_SINGLE_STEP\n(context)
+
+driver -> eu_ctrl: Configure:\n• Single-step mode\n• Trap after each instr\n• Pause at breakpoint
+
+== Execute First Instruction ==
+
+eu_ctrl -> eu: Execute one\ninstruction
+
+eu -> eu: Complete\ninstruction\n(at VA 0x100)
+
+eu -> eu_ctrl: TRAP signal\n(step complete)
+
+eu_ctrl -> eu_ctrl: Halt execution\nstatus = halted
+
+== Signal Debugger ==
+
+eu_ctrl -> driver: TRAP interrupt\n(single-step done)
+
+driver -> events: Insert event:\n• SINGLE_STEP_HIT\n• new_pc = 0x104\n• registers snapshot
+
+events -> debugger: Event ready\n(poll/eventfd)
+
+== Debugger Inspects ==
+
+debugger -> driver: Read event\nget new PC\nget register state
+
+debugger -> driver: Read memory/registers\nat this point
+
+debugger -> debugger: Show state\nto user:
+debugger -> debugger: PC: 0x104\nR0: 0x1234\nR1: 0x5678
+
+== Next Step ==
+
+debugger -> driver: ioctl: STEP_INSTRUCTION\n(same context)
+
+driver -> eu_ctrl: Execute next\ninstruction
+
+eu_ctrl -> eu: Continue 1 instr\n(from 0x104)
+
+eu -> eu: Complete\n(at 0x108)
+
+eu -> eu_ctrl: TRAP\n(done)
+
+eu_ctrl -> events: Insert SINGLE_STEP_HIT\n(0x108)
+
+events -> debugger: Event ready\n\nrepeat...
+
+@enduml
+```
+
+### Instruction Register Inspection
+
+```plantuml
+@startuml
+title Register Inspection: Reading GPU State
+
+participant "Debugger\nApp" as debugger
+participant "i915 Ioctl" as ioctl
+participant "Register\nAccess Engine" as reg_access
+participant "EU/Context" as eu
+participant "GPU Memory" as gpu_mem
+
+== Debugger Wants to Read Register ==
+
+debugger -> ioctl: ioctl: READ_REGISTERS\n(context, eu_id,\nregister_list)
+
+ioctl -> ioctl: Validate:\n• Context halted?\n• EU accessible?\n• Register valid?
+
+alt Context Not Halted
+  ioctl -> debugger: -EBUSY\n(halted state required)
+else Valid Request
+  ioctl -> reg_access: Queue register read
+end
+
+== Read EU Registers ==
+
+reg_access -> eu: Sample from EU:\n• General registers\n(R0-R127)\n• Special registers\n(IP, FLAGS, etc)
+
+eu -> eu: Return register\nvalues\n(snapshot)
+
+reg_access -> reg_access: Package response:\n[R0, R1, R2, ...]\nwith metadata
+
+ioctl -> debugger: Return register values:\nR0: 0x12345678\nR1: 0xABCDEF00\n...
+
+== Debugger Reads Memory ==
+
+debugger -> ioctl: ioctl: READ_MEMORY\n(context, va=0x1000,\nsize=256)
+
+ioctl -> reg_access: Read GPU memory\nat VA 0x1000\n256 bytes
+
+reg_access -> eu: Translate VA→PA\nfor this context
+
+reg_access -> gpu_mem: Read from GPU memory\nat PA
+
+gpu_mem -> reg_access: Data: 0x00 0x01 0x02 ...\n(256 bytes)
+
+reg_access -> ioctl: Return memory\ncontent
+
+ioctl -> debugger: Memory@0x1000:\n00 01 02 03 ...\n(256 bytes)
+
+@enduml
+```
+
+### Memory Breakpoints vs Instruction Breakpoints
+
+```plantuml
+@startuml
+title Breakpoint Types: Instruction vs Memory Access
+
+database "Instruction Breakpoints" {
+  state "Set at Code Address" as instr_set
+  note right of instr_set
+  • Address = instruction VA
+  • Triggers when PC reaches address
+  • Pause EU execution
+  • Can step from here
+  • ~5 breakpoints max (HW limit)
+  end note
+}
+
+database "Memory Breakpoints\n(Watchpoints)" {
+  state "Set on Data Address" as mem_set
+  note right of mem_set
+  • Address = data VA
+  • Triggers on load/store access
+  • Can specify: read/write/both
+  • Pause EU accessing data
+  • Limited hardware slots (2-4)
+  end note
+}
+
+rectangle "Example Scenarios" {
+  state "Instr: Find infinite loop" as sc1
+  note right of sc1
+  Set breakpoint at loop start
+  Hit repeatedly?
+  → infinite loop confirmed
+  end note
+  
+  state "Mem: Find corruption" as sc2
+  note right of sc2
+  Set watchpoint on buffer
+  Triggers when written
+  at address that corrupts
+  → found the bug!
+  end note
+  
+  state "Combined: Data flow" as sc3
+  note right of sc3
+  Breakpoint in function
+  Watchpoint on output buffer
+  → trace data propagation
+  end note
+}
+
+instr_set --> sc1
+mem_set --> sc2
+mem_set --> sc3
+
+@enduml
+```
+
+---
+
 ## Error Capture & Coredumps
 
 ### Comprehensive State Capture

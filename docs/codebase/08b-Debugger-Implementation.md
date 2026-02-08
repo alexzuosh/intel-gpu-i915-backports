@@ -457,6 +457,363 @@ void monitor_resets(void)
 
 ---
 
+## Deep Dive: Event-Driven Debugging
+
+### Event-Driven Debugger: Architecture and Communication
+
+```plantuml
+@startuml
+title Event-Driven Debugger: Kernel-Userspace Communication
+
+participant "Userspace\nDebugger App" as debugger
+participant "Event Subsystem" as event_sys
+participant "i915 Driver" as i915
+participant "GPU Hardware" as gpu_hw
+participant "Event FIFO Queue" as fifo
+
+== Debugger Initialization ==
+
+debugger -> event_sys: open("/dev/dri/card0")\nget file descriptor
+
+event_sys -> i915: Initialize debugger\nmode for this FD
+
+i915 -> fifo: Allocate event FIFO\n(ring buffer, 64KB)
+
+i915 -> i915: Register interrupt\nhandlers:\n• EU_ATTENTION\n• BREAKPOINT_HIT\n• WATCHPOINT_HIT\n• CONTEXT_SWITCH
+
+== GPU Breakpoint Hit ==
+
+gpu_hw -> gpu_hw: Execute instruction\nat breakpoint address
+
+gpu_hw -> i915: IRQ: EU_ATTENTION\n(breakpoint triggered)
+
+i915 -> i915: Handler:\n• Sample EU state\n• Get context info\n• Get instruction pointer\n• Get register snapshot
+
+i915 -> fifo: Insert event:\n{\n  type: BREAKPOINT_HIT\n  context_id: 0x1234\n  eu_id: 0\n  pc: 0x100\n  registers: [...]\n}
+
+== Userspace Notification ==
+
+fifo -> event_sys: Event added to queue
+
+event_sys -> event_sys: Signal wakeup:\n• eventfd write\n• poll() unblock\n• waitqueue wake
+
+event_sys -> debugger: Unblock poll()\ndata ready
+
+== Debugger Reads Event ==
+
+debugger -> fifo: ioctl: DEBUGGER_READ_EVENT
+
+fifo -> debugger: Return event:\nBREAKPOINT_HIT\nContext 0x1234, PC=0x100
+
+debugger -> debugger: Process event:\nupdate UI\nshow state
+
+== Debugger Commands Response ==
+
+debugger -> event_sys: ioctl: STEP_INSTRUCTION\n(context_id)
+
+event_sys -> i915: Enable single-step\nfor this context
+
+i915 -> gpu_hw: Configure EU\nfor single-step
+
+gpu_hw -> gpu_hw: Execute 1 instr\nwith trap
+
+gpu_hw -> i915: IRQ: TRAP\n(step complete)
+
+i915 -> fifo: Insert STEP_COMPLETE\nevent
+
+fifo -> debugger: Event ready\n(repeat cycle)
+
+@enduml
+```
+
+### Breakpoint Setting and Hit Flow
+
+```plantuml
+@startuml
+title Setting and Hitting Breakpoints: Complete Flow
+
+participant "GDB/Debugger" as gdb
+participant "i915 Driver\nBreakpoint Manager" as bpmgr
+participant "GPU Engine" as engine
+participant "EU (Execution Unit)" as eu
+
+== Debugger Sets Breakpoint ==
+
+gdb -> bpmgr: ioctl: SET_BREAKPOINT\n(context_id=0xABC\naddress=0x1000\ntype=INSTRUCTION)
+
+bpmgr -> bpmgr: Validate:\n• Is context valid?\n• Is address in code?\n• Have breakpoint slots?
+
+bpmgr -> bpmgr: Allocate HW slot:\nslot_id=0\n(typically 4-16 slots)
+
+bpmgr -> bpmgr: Configure slot:\nslot[0].address = 0x1000\nslot[0].type = INSTR\nslot[0].context_mask = 0xABC
+
+bpmgr -> engine: Program GPU:\nwrite to breakpoint\nregisters
+
+bpmgr -> gdb: SUCCESS\nbreakpoint_id=0
+
+== GPU Execution: Hits Breakpoint ==
+
+engine -> eu: Execute at VA 0x1000\n(matching context)
+
+eu -> eu: Check: Is this address\nin breakpoint table?
+
+alt Match Found
+  eu -> eu: EU_ATTENTION signal\n(breakpoint hit)
+  
+  eu -> eu: Halt execution\n(on instruction)
+  
+  engine -> engine: EU stopped\nsave state
+else No Match
+  eu -> eu: Continue normal\nexecution
+end
+
+== Interrupt Handling ==
+
+engine -> bpmgr: IRQ: EU_ATTENTION\nslot_0 triggered
+
+bpmgr -> bpmgr: Determine:\n• Which EU\n• Which context\n• PC = 0x1000
+
+bpmgr -> bpmgr: Capture state:\n• Instruction pointer\n• Registers\n• Memory context\n• Stack pointer
+
+bpmgr -> gdb: Event: BREAKPOINT_HIT\nbreakpoint_id=0\npc=0x1000\n(full state)
+
+== Debugger Response ==
+
+gdb -> gdb: Stop execution\nshow breakpoint\nallow inspection
+
+gdb -> bpmgr: Commands:\n• read registers\n• read memory\n• single step\n• continue
+
+@enduml
+```
+
+### Memory Watchpoint Architecture
+
+```plantuml
+@startuml
+title Watchpoints: Memory Access Breakpoints
+
+participant "Debugger" as debugger
+participant "Watchpoint Manager" as wpmgr
+participant "MMU/TLB" as mmu
+participant "EU" as eu
+participant "Memory Bus" as membus
+
+== Setting Watchpoint ==
+
+debugger -> wpmgr: ioctl: SET_WATCHPOINT\n(context\naddress=0x2000\ntype=WRITE\nsize=4bytes)
+
+wpmgr -> wpmgr: Validate:\n• VA in PPGTT?\n• Get physical address\n• Check HW slots\n(usually 2-4 total)
+
+wpmgr -> wpmgr: Allocate slot:\nslot[0]\n• PA for 0x2000\n• type=WRITE\n• size=4
+
+wpmgr -> mmu: Set trap on:\nPA 0xF1234000\n(physical address)
+
+wpmgr -> debugger: SUCCESS\nwatchpoint_id=0
+
+== GPU Access: Triggers Watchpoint ==
+
+eu -> eu: Execute write\ninstruction\nto VA 0x2000
+
+eu -> mmu: Translate VA 0x2000\n→ PA 0xF1234000
+
+mmu -> mmu: Check watchpoints\non this PA
+
+alt Watchpoint Match
+  mmu -> mmu: Access type matches?\nREAD vs WRITE\n(yes, WRITE)
+  
+  mmu -> eu: TRAP:\nWATCHPOINT_HIT
+  
+  eu -> eu: Halt\nsave state
+else No Match
+  mmu -> membus: Allow memory access
+  membus -> membus: Write data\n(normal)
+end
+
+== Interrupt Flow ==
+
+eu -> wpmgr: IRQ: WATCHPOINT_HIT\nslot[0]
+
+wpmgr -> wpmgr: Identify:\n• Which EU\n• Which context\n• PC (instruction)  • Address accessed\n• Access type (R/W)
+
+wpmgr -> debugger: Event: WATCHPOINT_HIT\nwatchpoint_id=0\naccessed_address=0x2000\naccess_type=WRITE\n(full state)
+
+== Debugger Analysis ==
+
+debugger -> debugger: Breakpoint on data!\n• Who accessed?\n• From where (PC)?\n• Why? (R or W)?\n• What value?
+
+@enduml
+```
+
+### State Capture During Hang: Detailed Process
+
+```plantuml
+@startuml
+title Error Capture Process: From Hang to Analysis
+
+participant "Watchdog" as wd
+participant "Hang Detector" as detector
+participant "State Capturer" as capturer
+participant "Coredump Buffer" as coredump
+participant "Analysis Tool" as analyzer
+
+== Hang Detected ==
+
+wd -> wd: Timeout: No completion\nfor 2.5 seconds
+
+wd -> detector: Hang detected\n(mark timestamp)
+
+== Immediately Capture ==
+
+detector -> capturer: i915_gpu_error_\nstate_alloc()
+
+capturer -> coredump: Allocate buffer\n(2-3MB)
+
+== Device State ==
+
+capturer -> coredump: Capture device-level:\n• i915 version\n• HW capabilities\n• GPU SKU\n• L3 cache size\n• EU count
+
+== Engine State ==
+
+capturer -> coredump: For each engine:\n• Ring buffers\n  (head/tail ptrs)\n• Ring contents\n  (commands around IP)\n• Engine status\n• Wait-for-sync state
+
+== Context State ==
+
+capturer -> coredump: For hung context:\n• LRC snapshot\n• Page table base\n• Instruction pointer\n• Registers\n• Hang timestamp
+
+== TLB/Fault State ==
+
+capturer -> coredump: Memory fault info:\n• Fault address\n• Fault type\n• Page table walk\n• PPGTT state
+
+== Batch Buffer ==
+
+capturer -> coredump: Batch around fault:\n• Instructions before\n• Instruction at fault\n• Instructions after\n• Command stream state
+
+== GuC State ==n
+capturer -> coredump: GuC/HuC state:\n• GuC log dump\n• HuC state\n• Context descriptors\n• Work queue state
+
+== Compress & Store ==
+
+coredump -> coredump: Compress error state\n(zlib compression)\nreduce size
+
+coredump -> coredump: Store in kernel\nmemory (debugfs)\n(/proc/i915/error)
+
+== Analysis ==
+
+analyzer -> coredump: Read error state\nvia /proc/i915/error\nor ioctl
+
+analyzer -> analyzer: Analyze:\n• Where was GPU?\n• What was executing?\n• What failed?\n• Why did it hang?\n• Root cause?
+
+analyzer -> analyzer: Generate report:\n• Timeline\n• Hypothesis\n• Recommendations
+
+@enduml
+```
+
+### Interactive Debugging Session: Step-by-Step
+
+```plantuml
+@startuml
+title Interactive Debugging: A Live Session
+
+actor User as user
+participant "GDB" as gdb
+participant "i915 Driver" as driver
+participant "GPU HW" as gpu
+
+== 1. Attach Debugger ==
+
+user -> gdb: gdb --gpu\n(attach to GPU)
+
+gdb -> driver: Connect to debugger\ninterface
+
+driver -> driver: Set up\nevent handling
+
+== 2. Set Breakpoint ==
+
+user -> gdb: break kernel_func\n(set breakpoint)
+
+gdb -> driver: ioctl: SET_BREAKPOINT\nat kernel_func VA
+
+driver -> gpu: Program breakpoint\nin GPU HW
+
+driver -> gdb: SUCCESS
+
+== 3. Continue Execution ==
+
+user -> gdb: continue\n(resume GPU)
+
+gdb -> driver: Resume GPU execution
+
+driver -> gpu: Clear HALT flag\nresume EU
+
+gpu -> gpu: Execute code...\nhitting breakpoint
+
+== 4. Breakpoint Hit ==
+
+gpu -> driver: IRQ: BREAKPOINT_HIT
+
+driver -> driver: Capture state:\nregisters, PC, stack
+
+driver -> gdb: Event + state
+
+gdb -> user: Program paused\nat breakpoint\nshow code context
+
+== 5. Inspect ==
+
+user -> gdb: print R0\n(show register)
+
+gdb -> driver: ioctl: READ_REGISTERS\n(get R0)
+
+driver -> gpu: Sample register state
+
+gpu -> driver: R0 = 0x12345678
+
+driver -> gdb: Return value
+
+gdb -> user: R0 = 0x12345678
+
+== 6. Memory Inspection ==
+
+user -> gdb: x/4 0x1000\n(dump memory)
+
+gdb -> driver: ioctl: READ_MEMORY\n(VA 0x1000, 16 bytes)
+
+driver -> gpu: Translate & read\nfrom GPU memory
+
+gpu -> driver: Data: 0x00 0x01 0x02 0x03 ...
+
+driver -> gdb: Return bytes
+
+gdb -> user: 0x1000: 00 01 02 03 ...
+
+== 7. Single Step ==
+
+user -> gdb: si\n(single step)
+
+gdb -> driver: ioctl: STEP_INSTRUCTION
+
+driver -> gpu: Enable single-step\nmode
+
+gpu -> gpu: Execute 1 instruction\n→ PC now 0x104
+
+gpu -> driver: IRQ: TRAP
+
+driver -> gdb: STEP_COMPLETE\nPC=0x104
+
+gdb -> user: Stepped to 0x104
+
+== 8. Continue ==
+
+user -> gdb: continue\n(resume)
+
+gdb -> driver: Resume GPU
+
+driver -> gpu: Resume execution\n(or hit next\nbreakpoint)
+
+@enduml
+```
+
+---
+
 ## Debugger Protocol Usage
 
 ### Complete Userspace Debugger Example

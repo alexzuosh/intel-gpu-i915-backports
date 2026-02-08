@@ -446,6 +446,269 @@ static void register_write_fn(struct i915_tbb *task)
 
 ---
 
+## Deep Dive: TBB Usage Patterns
+
+### Task Submission and Execution Timeline
+
+```plantuml
+@startuml
+title TBB Task Lifecycle: Submission to Completion
+
+participant "Submitter\nCPU" as submitter
+participant "Task Queue\n(per-node)" as queue
+participant "TBB Worker\nThread" as worker
+participant "GPU/Device" as device
+
+== Phase 1: Task Submission ==
+
+submitter -> submitter: Allocate task struct\ni915_tbb_task
+
+submitter -> submitter: Set callback:\ntask.fn = my_handler\ntask.priv = context
+
+submitter -> queue: i915_tbb_add_task(task)\n(queue on local node)
+
+queue -> queue: Append to queue\n(lock-free or atomic)
+
+queue -> queue: Incrementally wake\nworker if sleeping
+
+== Phase 2: Task Ready ==
+
+worker -> queue: Check local queue\n(per-CPU worker)
+
+queue -> worker: Task available:\nmy_handler
+
+worker -> worker: Dequeue task\n(atomic operation)
+
+== Phase 3: Execution ==
+
+worker -> worker: Call callback:\nmy_handler(task)
+
+worker -> device: Perform work:\n• Access hardware\n• Submit commands\n• Update state\n• Memory operations
+
+device -> device: Process\nwork
+
+worker -> worker: Callback\ncomplete
+
+== Phase 4: Cleanup ==
+
+worker -> worker: i915_tbb_put(task)\n(release reference)
+
+worker -> worker: Free task memory\n(if ref count = 0)
+
+== Completion ==
+
+worker -> submitter: Task fully\ncomplete and cleaned
+
+@enduml
+```
+
+### TBB Task in i915: Typical Usage Flow
+
+```plantuml
+@startuml
+title i915 TBB Usage: Real-World Pattern
+
+rectangle "i915 Codepath\n(e.g., Memory Shrinking)" {
+  participant "Shrinker Callback" as shrinker
+  participant "TBB Task Queue" as tbb
+  participant "Worker Thread" as worker
+  participant "Memory Region" as memregion
+}
+
+== Trigger: Memory Pressure ==
+
+shrinker -> shrinker: i915_gem_shrinker_scan()\ncalled by memory subsystem
+
+shrinker -> shrinker: Calculate:\nfreeable memory needed
+
+shrinker -> shrinker: Cannot free\nfrom atomic context\n(shrink callback)
+
+== Defer Work ==
+
+shrinker -> tbb: Schedule async work:\ni915_tbb_add_task(\nevict_objects_task)
+
+tbb -> tbb: Enqueue task\non local NUMA node
+
+tbb -> shrinker: Return immediately\n(not blocking)
+
+shrinker -> shrinker: Return to\nmemory subsystem
+
+== Async Execution ==
+
+worker -> tbb: Pop task\nfrom queue
+
+worker -> memregion: Execute eviction:\n• Select LRU objects\n• Unmap from GPU\n• Free physical pages
+
+memregion -> memregion: Objects evicted\nmemory freed
+
+worker -> worker: Task complete\ncleanup
+
+== Impact ==
+
+shrinker -> shrinker: Memory pressure\nresolved in background\n(non-blocking)
+
+note right of shrinker
+Key benefit:
+Shrinking doesn't block
+atomic context
+memory allocation
+responsive system
+end note
+
+@enduml
+```
+
+### Nested Task Submission: TBB Inside TBB
+
+```plantuml
+@startuml
+title Nested Task Submission: Task→Subtasks
+
+participant "Main Task\nHandler" as main_task
+participant "Queue" as queue
+participant "Subtask Handler" as subtask_handler
+participant "Hardware" as hw
+
+== Main Task Executes ==
+
+main_task -> main_task: Process batch\nof work items
+
+main_task -> main_task: Realize: Need\nto do follow-up\nwork (e.g., cleanup)
+
+== Submit Subtask ==
+
+main_task -> queue: i915_tbb_add_task(\ncleanup_task)
+
+queue -> queue: Enqueue\ncleanup task\n(may run on different CPU)
+
+main_task -> main_task: Return\n(main task done)
+
+== Subtask Runs ==
+
+subtask_handler -> subtask_handler: Execute cleanup:\n• Release references\n• Update state\n• Notify waiters
+
+subtask_handler -> subtask_handler: Complete\nand cleanup
+
+== Potential Issue ==
+
+main_task -> main_task: WARNING:\nIf not careful:\ndeep nesting\n→ stack usage\n→ priority inversion
+
+note right of main_task
+Nested submission OK
+but limit depth!
+Typical: 1-2 levels max
+end note
+
+@enduml
+```
+
+### Error Handling in TBB Tasks
+
+```plantuml
+@startuml
+title TBB Task Error Handling
+
+participant "i915 Subsystem" as i915
+participant "Task Handler" as handler
+participant "Error Path" as err_path
+participant "Cleanup" as cleanup
+participant "Requester" as requester
+
+== Normal Path ==
+
+i915 -> handler: i915_tbb_add_task(\nmy_fn, context)
+
+handler -> handler: Execute function:\nmy_fn(task_context)
+
+handler -> handler: Success:\nwork complete
+
+handler -> cleanup: i915_tbb_put(task)\nrelease
+
+== Error Path ==
+
+handler -> handler: Call fails:\nreturn -ENOMEM
+
+handler -> err_path: Handle error:\n• Cannot allocate\n• Cannot access HW\n• Timeout
+
+err_path -> err_path: Decision:\n• Retry later?\n• Fail permanently?\n• Reset HW?
+
+alt Retryable Error
+  err_path -> handler: Re-enqueue task\ni915_tbb_add_task(task)\nagain
+  
+  handler -> handler: Exponential backoff\n(avoid tight loop)
+else Fatal Error
+  err_path -> requester: Signal error\nto original requester
+  
+  requester -> requester: Handle failure:\n• Cleanup\n• User notification\n• Recovery
+end
+
+err_path -> cleanup: i915_tbb_put(task)\nrelease
+
+cleanup -> cleanup: Free resources
+
+@enduml
+```
+
+### TBB with Synchronization: Waiting for Tasks
+
+```plantuml
+@startuml
+title TBB Task Completion: Synchronization Patterns
+
+participant "Submitter" as submitter
+participant "Task Queue" as queue
+participant "Worker\nThread" as worker
+participant "Completion\nWaitqueue" as waitq
+
+== Submit Task with Completion ==
+
+submitter -> submitter: Allocate task\nwith completion:\ntask.done = 0
+
+submitter -> queue: i915_tbb_add_task(task)
+
+submitter -> submitter: Need to wait:\ni915_wait_task(\ntask, timeout)
+
+note right of submitter
+Cannot spin-wait!
+Must sleep/block
+end note
+
+submitter -> waitq: Add to waitqueue:\nwait_event_timeout(\ntask.done)
+
+note right of submitter
+This blocks until:
+• Task completes (done=1)\n
+• Timeout expires
+• Signal received
+end note
+
+== Task Executes ==
+
+worker -> queue: Dequeue task
+
+worker -> worker: Execute callback:\nmy_fn(task)
+
+worker -> worker: Work complete
+
+worker -> worker: Mark done:\ntask.done = 1
+
+worker -> waitq: wake_up(&task.waitq)\n(signal completion)
+
+worker -> worker: i915_tbb_put(task)
+
+== Waiter Wakes ==
+
+waitq -> submitter: Unblock from\nwait_event_timeout
+
+submitter -> submitter: Check: done == 1?\nYES → success
+
+submitter -> submitter: Continue\nor handle error
+
+@enduml
+```
+
+---
+
 ## Code Examples
 
 ### Example 1: Memory Pressure Handler
