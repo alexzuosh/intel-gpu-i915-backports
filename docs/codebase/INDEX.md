@@ -50,6 +50,31 @@ In-depth coverage of specialized subsystems.
 | 08b | [08b-Debugger-Implementation.md](08b-Debugger-Implementation.md) | Debugger implementation details | 400+ | 2 |
 | 09 | [09-i915-Fence-Timeline-Study.md](09-i915-Fence-Timeline-Study.md) | Fence lifecycle & synchronization | 850 | 5 |
 
+### TIER 2 Extended: Infrastructure & Operations (NEW - 10-16)
+Critical infrastructure systems and operational subsystems.
+
+| # | File | Focus Area | Lines | Diagrams |
+|---|------|-----------|-------|----------|
+| 10 | [10-Hardware-Discovery-Initialization.md](10-Hardware-Discovery-Initialization.md) | GPU detection & initialization | 420 | 4 |
+| 11 | [11-Error-Handling-Recovery.md](11-Error-Handling-Recovery.md) | GPU error & recovery handling | 450 | 4 |
+| 12 | [12-Interrupt-Handling.md](12-Interrupt-Handling.md) | Interrupt processing & management | 380 | 3 |
+| 13 | [13-Firmware-Loading-Management.md](13-Firmware-Loading-Management.md) | GuC/HuC firmware loading & verification | 380 | 3 |
+| 14 | [14-Performance-Monitoring-OA.md](14-Performance-Monitoring-OA.md) | Performance monitoring & counters | 420 | 3 |
+| 15 | [15-User-Space-Interface-UAPI.md](15-User-Space-Interface-UAPI.md) | GEM API & user-space interface | 450 | 4 |
+| 16 | [16-Runtime-Power-Management.md](16-Runtime-Power-Management.md) | Runtime PM & autosuspend | 400 | 3 |
+
+### TIER 3 Extended: System Features (NEW - 17-22)
+Feature-specific subsystems and optional capabilities.
+
+| # | File | Focus Area | Lines | Diagrams |
+|---|------|-----------|-------|----------|
+| 17 | [17-Display-Output-Management.md](17-Display-Output-Management.md) | Display pipeline & hotplug | 380 | 4 |
+| 18 | [18-DMA-Buffer-Operations.md](18-DMA-Buffer-Operations.md) | DMA engines & buffer ops | 350 | 3 |
+| 19 | [19-Hardware-Workarounds.md](19-Hardware-Workarounds.md) | Errata & workarounds | 320 | 2 |
+| 20 | 20-Command-Stream-Execution.md *(planned)* | Batch buffer execution | — | — |
+| 21 | 21-Scheduling-Arbitration.md *(planned)* | GPU scheduling & arbitration | — | — |
+| 22 | 22-Security-Sandbox.md *(planned)* | Security & sandboxing | — | — |
+
 ### TIER 4: Reference & Summaries
 Supporting documentation and project summaries.
 
@@ -85,7 +110,7 @@ docs/codebase/
 │   ├── 04-Power-Management.md                 (power control & scaling)
 │   └── 05-Request-Scheduling.md               (work scheduling)
 │
-├── Advanced Topics (TIER 3: 06-09)
+├── Advanced Topics (TIER 3: 06-09+17-19)
 │   ├── 06-Virtual-Memory.md                   (MMU & address translation)
 │   ├── 06a-CPU-GPU-Coherency.md               (memory coherency - iGPU/dGPU)
 │   ├── 06b-Memory-Migration.md                (memory relocation & TTM)
@@ -95,7 +120,19 @@ docs/codebase/
 │   ├── 07b-TBB-Implementation-Guide.md        (TBB patterns)
 │   ├── 08-Debugger-Support.md                 (debug infrastructure)
 │   ├── 08b-Debugger-Implementation.md         (debug implementation)
-│   └── 09-i915-Fence-Timeline-Study.md        (synchronization primitives)
+│   ├── 09-i915-Fence-Timeline-Study.md        (synchronization primitives)
+│   ├── 17-Display-Output-Management.md        (display pipeline)
+│   ├── 18-DMA-Buffer-Operations.md            (DMA engines)
+│   └── 19-Hardware-Workarounds.md             (errata & workarounds)
+│
+├── Infrastructure & Operations (TIER 2 Ext: 10-16) [NEW]
+│   ├── 10-Hardware-Discovery-Initialization.md (GPU detection & init)
+│   ├── 11-Error-Handling-Recovery.md          (error & recovery)
+│   ├── 12-Interrupt-Handling.md               (interrupt processing)
+│   ├── 13-Firmware-Loading-Management.md      (firmware loading)
+│   ├── 14-Performance-Monitoring-OA.md        (performance monitoring)
+│   ├── 15-User-Space-Interface-UAPI.md        (GEM/UAPI)
+│   └── 16-Runtime-Power-Management.md         (runtime PM)
 │
 └── Reference & Summaries (TIER 4)
     ├── README.md
@@ -225,14 +262,14 @@ Week 2: Advanced Topics
 ## 📊 Content Statistics
 
 ### Document Counts
-- **Total Documents:** 23 (14 core + 9 reference)
-- **Core Subsystem Docs:** 14
-- **Reference & Summary Docs:** 9
+- **Total Documents:** 32 (22 core + 10 reference)
+- **Core Subsystem Docs:** 22 (05 tier 2 + 07 tier 2ext + 10 tier 3+3ext)
+- **Reference & Summary Docs:** 10
 
 ### Content Volume
-- **Total Lines:** 20,000+
-- **Total Diagrams:** 130+
-- **Code Examples:** 50+
+- **Total Lines:** 26,000+
+- **Total Diagrams:** 150+
+- **Code Examples:** 70+
 
 ### Diagram Distribution
 | Category | Count | Focus |
@@ -314,11 +351,11 @@ Week 2: Advanced Topics
 **Documentation Path:** `/home/alex/code/intel-gpu-i915-backports/docs/codebase/`
 
 ### Key Statistics
-- **Documents:** 23 files (14 core, 9 reference)
-- **Diagrams:** 130+ PlantUML diagrams
-- **Content:** 20,000+ lines
-- **Code Examples:** 50+ real i915 code snippets
-- **Last Updated:** February 2026
+- **Documents:** 32 files (22 core, 10 reference)
+- **Diagrams:** 150+ PlantUML diagrams
+- **Content:** 26,000+ lines
+- **Code Examples:** 70+ real i915 code snippets
+- **Last Updated:** February 8, 2026
 
 ---
 
@@ -326,6 +363,7 @@ Week 2: Advanced Topics
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.5 | Feb 8, 2026 | Added 10 infrastructure & operations docs (10-19), expanded to 32 documents |
 | 3.0 | Feb 2026 | Complete reorganization & improved index structure |
 | 2.1 | Feb 2026 | Added CPU-GPU coherency documentation |
 | 2.0 | Feb 2026 | Added advanced topic documentation |
