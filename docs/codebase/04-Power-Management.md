@@ -567,6 +567,466 @@ Dynamic allocation based on activity
 
 ---
 
+## Deep Dive: Power Management State Transitions
+
+### Complete RPS (Frequency Scaling) Workflow
+
+```plantuml
+@startuml
+title RPS (Render Performance State): Frequency Scaling Flow
+
+participant "GPU Load Monitor" as monitor
+participant "RPS Driver" as rps
+participant "Frequency Controller" as freq
+participant "Power Domain" as pwr
+
+== Monitor Workload ==
+
+monitor -> monitor: Poll/measure GPU load\n(Energy Information counter)
+
+monitor -> rps: Report EI counter update\nevery ~130ms
+
+== Load Analysis ==
+
+rps -> rps: Calculate GPU utilization:\nutil% = ei_delta / time_delta
+
+rps -> rps: Compare with thresholds:
+rps -> rps: - Too busy? (util > 90%)
+rps -> rps: - Good load? (60-90%)
+rps -> rps: - Light load? (< 10%)
+
+== Frequency Decision ==
+
+alt High Load Detected
+  rps -> freq: Increase frequency\n(up to RP0/boost)
+  freq -> pwr: Adjust voltage\nfor new frequency
+  pwr -> pwr: Enable higher freq domain
+else Light Load
+  rps -> freq: Decrease frequency\n(down to RPn/min)
+  freq -> pwr: Lower voltage
+  pwr -> pwr: Switch to lower freq domain
+else Balanced Load
+  rps -> freq: Maintain current frequency
+  freq -> pwr: Keep voltage stable
+end
+
+== Feedback Loop ==
+
+freq -> monitor: Frequency changed
+
+monitor -> monitor: Continue monitoring\nnew workload
+
+rps -> rps: Schedule next check\n(~130ms timeout)
+
+@enduml
+```
+
+### RC6 Power Gating: Sleep & Wake Sequence
+
+```plantuml
+@startuml
+title RC6 Power Gating: Entry and Exit Flow
+
+participant "GPU Engine" as engine
+participant "RC6 Controller" as rc6
+participant "Power Domain" as pwr
+participant "CPU/Wakeup" as cpu
+
+== Idle Detection ==
+
+engine -> engine: All contexts idle
+engine -> engine: No pending work
+engine -> rc6: Request power gating\n(RC6 entry)
+
+== RC6 Entry ==
+
+rc6 -> rc6: Prepare for sleep:
+rc6 -> rc6: - Save context state
+rc6 -> rc6: - Flush caches
+rc6 -> rc6: - Set exit handler
+
+rc6 -> pwr: Enter RC6\n(Clock/Power gate)
+
+pwr -> pwr: Disable frequency scaling
+pwr -> pwr: Gate clocks to engines
+pwr -> pwr: Gate power to components
+
+pwr -> pwr: Power state = RC6\nPower draw ~100mW
+
+== Sleep Duration ==
+
+pwr -> pwr: GPU in RC6\nMinimal power consumption
+
+note right of pwr
+Context retained in
+on-die memory
+No DDR access needed
+end note
+
+== Work Arrives ==
+
+cpu -> cpu: New GPU work submitted\nor interrupt triggered
+
+cpu -> rc6: Wakeup request\n(software or HW event)
+
+== RC6 Exit ==
+
+rc6 -> pwr: Exit RC6\nRestore power
+
+pwr -> pwr: Enable clock gates
+pwr -> pwr: Restore power domains
+
+pwr -> pwr: Restore voltages\nfor operation
+
+rc6 -> rc6: Restore context state\nfrom on-die memory
+
+rc6 -> engine: Ready for execution
+
+== Resume Execution ==
+
+engine -> engine: Execute pending work
+
+note right of rc6
+Exit latency: 1-2ms
+Wake time depends on
+RC6 level (RC6p/RC6pp
+may need DDR refresh)
+end note
+
+@enduml
+```
+
+### SLPC (Self-managed Low Power Controller) Operation
+
+```plantuml
+@startuml
+title SLPC: GuC Self-managed Frequency Controller
+
+participant "GPU Load" as load
+participant "GuC SLPC" as slpc
+participant "Frequency Table" as freq_table
+participant "Voltage Regulator" as vreg
+
+== Autonomous Control ==
+
+load -> slpc: GuC monitors load\ndirectly (no CPU IRQ)
+
+slpc -> slpc: Access performance\ncounters directly
+
+slpc -> slpc: Calculate utilization\nwithout CPU help
+
+== Frequency Decision ==
+
+slpc -> slpc: Compare load vs thresholds:
+slpc -> slpc: - RP0 (100%): highest freq
+slpc -> slpc: - RP1 (95%): high freq
+slpc -> slpc: - RP25 (50%): mid freq
+slpc -> slpc: - RPe (0%): idle freq
+
+alt High Load
+  slpc -> freq_table: Look up high freq\n(RP0/RP1)
+  slpc -> slpc: Ramp frequency up\ngradually
+else Medium Load
+  slpc -> freq_table: Look up mid freq
+  slpc -> slpc: Hold at stable freq
+else Low Load
+  slpc -> freq_table: Look up low freq\n(RPe)
+  slpc -> slpc: Power save mode
+end
+
+== Voltage/Frequency Adjustment ==
+
+slpc -> vreg: Set frequency & voltage\nfrom lookup table
+
+vreg -> vreg: Adjust PMIC/VDD\nto match frequency
+
+vreg -> slpc: ACK - frequency set
+
+== Continuous Optimization ==
+
+slpc -> slpc: Monitor new load
+
+slpc -> slpc: Feedback loop:\nevery ~1ms in GuC\n(no CPU wake!)
+
+note right of slpc
+Key benefit:
+GuC adjusts frequency
+without waking CPU
+from sleep/idle
+Autonomously optimizes
+power/performance
+end note
+
+@enduml
+```
+
+### Power Well Hierarchy and Control
+
+```plantuml
+@startuml
+title Power Well Hierarchy: Domain Dependencies
+
+rectangle "Root Power Well" as root {
+  rectangle "Always-On" as aon {
+    database "System Agent\n(Always on)" as sa
+  }
+}
+
+rectangle "Display Power Wells" {
+  rectangle "DPLL Well" as dpll {
+    database "DPLL0 (Display PLL)" as dpll0
+    database "DPLL1" as dpll1
+  }
+  
+  rectangle "Pipe Wells" {
+    database "Pipe A Power\n(DDI A/B)" as pipe_a
+    database "Pipe B Power\n(DDI C/D)" as pipe_b
+  }
+}
+
+rectangle "GT (Render) Power Wells" {
+  rectangle "GT Core" as gt_core {
+    database "Render Engine" as rcs
+    database "Blitter Engine" as bcs
+  }
+  
+  rectangle "Media Wells" {
+    database "Video Decode" as vcs
+    database "Video Enhance" as vecs
+  }
+  
+  rectangle "Slice/Subslice" as ss {
+    database "Slice 0\n(variable power)" as s0
+    database "Slice 1\n(can be gated)" as s1
+  }
+}
+
+root --> dpll
+root --> gt_core
+root --> vcs
+
+dpll --> pipe_a
+dpll --> pipe_b
+
+gt_core --> ss
+
+note right of root
+All other power wells
+dependent on root
+Gating root gates entire
+GPU
+end note
+
+note right of ss
+Slice 1 can be powered
+down for power saving
+depends on workload
+end note
+
+@enduml
+```
+
+### Runtime PM Device State Machine
+
+```plantuml
+@startuml
+title Runtime PM: Device Suspend/Resume State Machine
+
+state "ACTIVE" as active
+state "AUTOSUSPEND_SCHEDULED" as autosched
+state "SUSPENDING" as suspending
+state "SUSPENDED" as suspended
+state "RESUMING" as resuming
+
+[*] --> active: Device in use
+
+active --> autosched: GPU idle\nAutosuspend timeout\n(e.g., 200ms)
+
+autosched --> suspending: Timeout expires\nor explicit suspend
+
+suspending --> suspended: Suspend callbacks\nRC6 enabled\nClock gated
+
+suspended --> resuming: GPU work arrives\nor explicit resume
+
+resuming --> active: Resume callbacks\nClocks enabled\nRC6 exit
+
+active --> suspending: Explicit suspend\n(e.g., sleep)
+
+suspended --> suspended: Additional idle\n(stays suspended)
+
+note right of suspending
+During suspend:
+1. Flush pending work
+2. Enable RC6
+3. Clock gates
+4. Unmap GTT
+5. Device quiescent
+end note
+
+note right of suspended
+Power draw: ~1W (from GPU)\n+ interconnect power
+All clocks gated
+Minimal state retained
+end note
+
+@enduml
+```
+
+### Frequency Scaling Decision Tree
+
+```plantuml
+@startuml
+title RPS Frequency Scaling: Adaptive Algorithm
+
+start
+
+:Monitor GPU load\nvia EI counter;
+
+:Calculate utilization\nutil% = (EI_delta/time);
+
+if (util > 90%?) then (yes)
+  :High load detected;
+  if (current_freq == RP0?) then (yes)
+    :Already at max;
+    :Hold frequency;
+  else (no)
+    :Increase frequency\ntoward RP0;
+    note right
+    Gradual increase
+    up to 5 levels
+    per adjustment
+    end note
+  endif
+elseif (util > 50%?) then (yes)
+  :Medium load;
+  if (current_freq > RP1?) then (yes)
+    :Decrease frequency\ntoward RP1;
+  else (no)
+    if (current_freq < RP1?) then (yes)
+      :Increase frequency\ntoward RP1;
+    else (no)
+      :Maintain frequency;
+    endif
+  endif
+else (no - low load)
+  :Light load (<50%);
+  if (current_freq > RPn?) then (yes)
+    :Decrease frequency\ntoward RPn (min);
+  else (no)
+    :At minimum\nfrequency;
+  endif
+endif
+
+:Schedule next check\n(~130ms);
+
+:Return to monitoring;
+
+stop
+
+@enduml
+```
+
+### Power Budget Distribution
+
+```plantuml
+@startuml
+title Power Budget Allocation Across GPU Components
+
+rectangle "Total Power Budget (PL1)" {
+  rectangle "Dynamic Power" as dyn {
+    database "Render Engine\n(40%)" as render
+    database "Media Engines\n(30%)" as media
+    database "Display\n(20%)" as display
+    database "Uncore/System\n(10%)" as uncore
+  }
+  
+  rectangle "Static Power (Leakage)" as static {
+    database "Always-on\nsubsystems\n(~5-10%)" as always_on
+  }
+}
+
+note right of render
+Dynamic power depends on:
+- Frequency
+- Voltage
+- Switching activity
+end note
+
+note right of display
+Display adds significant
+power load
+especially high refresh
+or high resolution
+end note
+
+note right of static
+Leakage current
+proportional to
+temperature & voltage
+end note
+
+@enduml
+```
+
+### Thermal Throttling & Temperature Control
+
+```plantuml
+@startuml
+title Thermal Throttling: Temperature-based Frequency Capping
+
+participant "Thermal Sensor" as thermal
+participant "Throttle Manager" as throttle
+participant "RPS" as rps
+participant "Frequency Controller" as freq
+
+== Temperature Monitoring ==
+
+thermal -> thermal: Monitor GPU die temperature\nevery ~100ms
+
+thermal -> throttle: Report temperature
+
+== Throttle Decision ==
+
+throttle -> throttle: Check temperature vs thresholds:
+throttle -> throttle: - Normal: < 85°C
+throttle -> throttle: - Caution: 85-95°C
+throttle -> throttle: - Critical: > 95°C
+
+alt Temperature Normal
+  throttle -> rps: Allow full frequency range
+  rps -> rps: Use standard RPS logic
+else Temperature Elevated
+  throttle -> rps: Cap maximum frequency\nto RP1 or RPn
+  rps -> rps: Limit ceiling\nto cooler operation
+else Temperature Critical
+  throttle -> throttle: Trigger emergency\nfrequency reduction
+  throttle -> freq: Set frequency to minimum\nto cool down
+  freq -> freq: Ramp down to RPe\n(idle/emergency)
+  
+  note right of freq
+  Prevent thermal damage
+  prioritize cooling
+  over performance
+  end note
+end
+
+== Cooling ==
+
+freq -> thermal: Thermal load decreases\nAs frequency drops
+
+thermal -> thermal: Temperature drops\n(next sample)
+
+thermal -> throttle: Report lower temperature
+
+throttle -> rps: Remove throttle\nRestore normal operation
+
+rps -> rps: Frequency scaling\nresumes normally
+
+@enduml
+```
+
+---
+
 ## Sysfs Interface
 
 ### Power Management Parameters:
