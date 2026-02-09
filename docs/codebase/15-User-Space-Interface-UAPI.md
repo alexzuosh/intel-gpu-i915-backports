@@ -925,6 +925,195 @@ struct intel_breadcrumbs {
 | **Responsiveness** | Multiple paths (breadcrumbs, WQ, poll) cover all scenarios |
 | **Debuggability** | Can distinguish between hardware error, context error, and timeout |
 
+### VM Bind User Fence Mechanism
+
+The VM Bind (Virtual Memory Bind) operation supports User Fence notifications to signal completion of asynchronous memory mapping operations directly to user-space without system calls.
+
+#### **VM Bind User Fence Architecture**
+
+```
+VM Bind Operation with User Fence:
+┌──────────────────────────────────────────────────────────┐
+│ User Space Application                                   │
+│  ├─ Allocate fence buffer (GEM object)                   │
+│  ├─ Map fence buffer to user VA                          │
+│  └─ Call DRM_IOCTL_I915_GEM_VM_BIND with fence ext      │
+└────────────────────┬─────────────────────────────────────┘
+                     │ Async VM Bind Operation
+┌────────────────────▼─────────────────────────────────────┐
+│ Kernel: i915_gem_vm_bind_obj()                           │
+│  ├─ ufence_create() - Create dma_fence_work              │
+│  │  └─ Choose ops based on user buffer type              │
+│  │     ├─ ufence_page_ops (get_user_pages succeeded)     │
+│  │     ├─ ufence_mm_ops (need kthread context)           │
+│  │     └─ ufence_nops (disabled/error)                   │
+│  │                                                       │
+│  ├─ vma_bind_insert() - Insert VMA into page tables      │
+│  │  └─ Pins pages, sets up TLB entries                   │
+│  │                                                       │
+│  └─ queue async execution                                │
+└────────────────────┬─────────────────────────────────────┘
+                     │ On Completion
+┌────────────────────▼─────────────────────────────────────┐
+│ dma_fence_work completion callback                       │
+│  (ufence_kmap or ufence_mm)                              │
+│                                                         │
+│ 1. ufence_sync() - Invalidate TLBs across all GTs        │
+│    └─ intel_gt_invalidate_tlb_sync(gt, sync[id])         │
+│                                                         │
+│ 2. Write completion value to user buffer                 │
+│    ├─ kmap_atomic() - Map page (ufence_page_ops)         │
+│    ├─ memcpy(user_ptr, &val) - Atomic write              │
+│    └─ kunmap_atomic()                                    │
+│       or                                                 │
+│    ├─ kthread_use_mm(mm) - Switch memory context         │
+│    ├─ copy_to_user(user_ptr, &val)                       │
+│    └─ kthread_unuse_mm(mm)                               │
+│                                                         │
+│ 3. Wake up global device wait queue                      │
+│    └─ if (waitqueue_active(vb->wq))                      │
+│        wake_up_all(&vm->i915->user_fence_wq)             │
+└────────────────────┬─────────────────────────────────────┘
+                     │
+┌────────────────────▼─────────────────────────────────────┐
+│ User Space Wakeup                                        │
+│  ├─ Application polling fence buffer (no syscall)        │
+│  └─ Or blocked in wait_user_fence_ioctl() - gets woken   │
+│     by global WQ wake-up                                 │
+└──────────────────────────────────────────────────────────┘
+```
+
+#### **User Fence Write Operation Sequence**
+
+| Step | Operation | Code Location | Purpose |
+|------|-----------|---|---------|
+| 1 | TLB Invalidation | `ufence_sync()` | Ensure page tables are visible to GPU |
+| 2 | Page Mapping | `kmap_atomic()` / `kthread_use_mm()` | Access user-allocated page from kernel |
+| 3 | Atomic Write | `memcpy()` / `copy_to_user()` | Write completion value |
+| 4 | Global WQ Wake | `wake_up_all(&user_fence_wq)` | Wake all processes waiting on global WQ |
+
+#### **User Fence Memory Layout**
+
+```c
+// User-space fence buffer structure
+typedef struct {
+    __u64 fence_value;      // Completion value (64-bit atomic)
+    __u32 fence_flags;      // Completion flags
+    __u32 reserved;         // Padding/future use
+    // Additional fields...
+} user_fence_t;
+
+// In kernel dma_fence_work:
+struct vm_bind_user_fence {
+    struct dma_fence_work base;      // Async work framework
+    struct user_fence user_fence;    // User buffer info
+    struct wait_queue_head *wq;      // ← Points to global device WQ
+};
+
+// Assigned during ufence_create():
+vb->wq = &vm->i915->user_fence_wq;   // Line 183 in i915_gem_vm_bind_object.c
+```
+
+#### **Global Wait Queue Integration**
+
+When VM Bind completes, the dma_fence_work completion callback:
+
+```c
+// Two possible completion paths:
+
+// Path 1: ufence_page_ops (direct page write - fast)
+static void ufence_kmap(struct dma_fence_work *work)
+{
+    struct vm_bind_user_fence *vb = container_of(work, ...);
+    struct user_fence *ufence = &vb->user_fence;
+    
+    ufence_sync(ufence);  // TLB invalidation
+    
+    va = kmap_atomic(ufence->page);
+    memcpy(va + offset_in_page(ufence->ptr), &ufence->val, 
+           sizeof(ufence->val));
+    
+    if (waitqueue_active(vb->wq))      // ← Check if anyone waiting
+        wake_up_all(vb->wq);           // ← Wake global device WQ
+    
+    kunmap_atomic(va);
+}
+
+// Path 2: ufence_mm_ops (kernel context switch - for complex memory)
+static int ufence_mm(struct dma_fence_work *work)
+{
+    struct vm_bind_user_fence *vb = container_of(work, ...);
+    struct user_fence *ufence = &vb->user_fence;
+    struct mm_struct *mm = ufence->mm;
+    
+    if (mmget_not_zero(mm)) {
+        ufence_sync(ufence);  // TLB invalidation
+        
+        kthread_use_mm(mm);   // Switch to user memory context
+        
+        if (copy_to_user(ufence->ptr, &ufence->val, 
+                        sizeof(ufence->val)) == 0) {
+            if (waitqueue_active(vb->wq))
+                wake_up_all(vb->wq);   // ← Wake global device WQ
+            ret = 0;
+        }
+        
+        kthread_unuse_mm(mm);
+        mmput(mm);
+    }
+    
+    return ret;
+}
+```
+
+#### **Impact on Application Synchronization**
+
+When application calls `wait_user_fence_ioctl()` while VM Bind is in progress:
+
+```
+Timeline:
+
+T0: App calls wait_user_fence_ioctl()
+    └─ Registers wait queues (global, context, breadcrumbs)
+
+T1: VM Bind operation queued to async worker
+    └─ dma_fence_work scheduled
+
+T2: Worker executes async bind (vma_bind_insert)
+    └─ Page tables updated, TLB flushed
+
+T3: dma_fence_work completion callback (ufence_kmap/ufence_mm)
+    ├─ TLB synchronization across all GTs
+    ├─ Write fence value to user buffer
+    └─ wake_up_all(&vm->i915->user_fence_wq)  ← WAKE GLOBAL WQ
+       
+       Application's wait loop is woken:
+       ├─ Re-checks ufence_compare() condition
+       ├─ Checks error conditions (context banned, PCI error, etc.)
+       └─ May return success or error
+
+T4: Application continues execution
+    └─ Can immediately access newly-bound memory
+```
+
+#### **Key Design Points**
+
+1. **Global WQ Used:** VM Bind always uses global device `user_fence_wq`, not context-specific WQ
+   - Reason: VM Bind is tied to address space (VM), not to specific context
+   - Multiple contexts can share same VM and wait on same bind
+
+2. **TLB Synchronization Included:** `ufence_sync()` invalidates TLBs before writing fence value
+   - Ensures GPU sees new page table entries before fence is signaled
+   - Prevents race where application reads fence but GPU still has stale TLB entries
+
+3. **Two Write Paths:** Choice between `ufence_kmap` vs `ufence_mm` depends on page pinning
+   - **ufence_page_ops:** Fast path (~100ns) using atomic operations
+   - **ufence_mm_ops:** Fallback when page cannot be directly pinned
+
+4. **No Context Association:** SOFT wait flag behavior does NOT affect VM Bind fences
+   - VM Bind fences always write to global WQ
+   - Separate from context-specific user fence waits (which SOFT flag affects)
+
 #### **Error Propagation Example**
 
 ```

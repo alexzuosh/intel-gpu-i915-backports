@@ -1,6 +1,6 @@
 # Intel i915 GPU Driver Documentation Index
 
-**Version:** 3.9 | **Last Updated:** February 8, 2026 | **Total Content:** 180+ diagrams, 29,500+ lines | **Status:** ✅ COMPLETE
+**Version:** 3.10 | **Last Updated:** February 8, 2026 | **Total Content:** 180+ diagrams, 29,700+ lines | **Status:** ✅ COMPLETE
 
 ---
 
@@ -403,7 +403,7 @@ Week 2: Advanced Topics
 - **Documentation:** 35 total files (25 core + 10 reference)
 - **Code Examples:** 150+ real i915 kernel code snippets
 - **Diagrams:** 180+ flow diagrams and architecture visualizations
-- **Total Content:** 29,500+ lines of comprehensive documentation (including Breadcrumbs + wait queue management)
+- **Total Content:** 29,700+ lines of comprehensive documentation (including Breadcrumbs + wait queue management + VM Bind User Fence)
 
 ---  
 **Maintained by:** Intel GPU Driver Documentation Team  

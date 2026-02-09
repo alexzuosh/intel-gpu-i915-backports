@@ -1,6 +1,6 @@
 # Intel i915 GPU Driver - Complete Codebase Documentation
 
-**Documentation Version:** 3.9 | **Last Updated:** February 8, 2026 | **Status:** ✅ COMPLETE
+**Documentation Version:** 3.10 | **Last Updated:** February 8, 2026 | **Status:** ✅ COMPLETE
 
 ---
 
@@ -10,7 +10,7 @@ This comprehensive documentation covers all major functional components of the I
 
 **📊 Quick Stats:**
 - **35 total documents** (25 core + 10 reference)
-- **29,500+ lines** of documentation
+- **29,700+ lines** of documentation
 - **180+ diagrams** and visualizations
 - **150+ code examples** from real i915 source
 - **100% coverage** of all planned topics (10-22 complete)
