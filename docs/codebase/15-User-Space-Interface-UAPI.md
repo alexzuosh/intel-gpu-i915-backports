@@ -6,13 +6,13 @@
 
 ## Executive Summary
 
-The user-space API (UAPI) is the fundamental interface between applications and the i915 GPU driver. This document covers GEM objects, execbuf submissions, contexts, and synchronization primitives.
+The user-space API (UAPI) is the fundamental interface between applications and the i915 GPU driver. This document covers GEM objects, execbuf submissions, contexts, and synchronization primitives including the high-performance User Fence mechanism.
 
 ### Key Topics
 - **GEM API:** Memory object creation and management
 - **Execution submission:** Batch buffer submission, dependency handling
 - **Contexts:** GPU context creation, isolation, performance tracking
-- **Synchronization:** Fences, semaphores, timing
+- **Synchronization:** Traditional fences, syncobj, User Fence (ufence) with sub-microsecond latency
 
 ### Performance Metrics
 - **ioctl latency:** 100-500µs for simple operations
@@ -524,6 +524,213 @@ int submit_with_syncobj_deps(int fd, uint32_t ctx_id,
     return drmIoctl(fd, DRM_IOCTL_I915_GEM_EXECBUFFER2_EXT, &exec);
 }
 ```
+
+### User Fence (ufence) - Low-Latency Synchronization
+
+User Fence is a high-performance synchronization primitive that allows GPU completion notifications directly to user-space memory without system calls, achieving sub-microsecond latency.
+
+**Architecture:**
+```
+User Fence Notification Stack
+┌──────────────────────────┐
+│ User Fence (ufence)      │  ← Application-level API
+│ ├─ VM Bind notification  │
+│ ├─ Execbuffer completion │
+│ └─ Wait conditional      │
+└────────────┬─────────────┘
+             │
+┌────────────▼──────────────┐
+│ dma_fence_work           │  ← Work queue wrapper
+│ └─ Async task execution  │
+└────────────┬──────────────┘
+             │
+┌────────────▼──────────────┐
+│ Linux dma_fence          │  ← Kernel sync primitive
+│ ├─ DMA ops               │
+│ ├─ Completion callbacks  │
+│ └─ Reference counting    │
+└──────────────────────────┘
+```
+
+**Use Cases:**
+
+1. **VM Bind Notifications** - Async VM bind operations notify completion via ufence
+2. **Execbuffer Completion** - Batch buffer submission completion signals user fence
+3. **Conditional Wait** - Wait with operators (EQ, NEQ, GT, GTE, LT, LTE) on memory value
+4. **TLB Synchronization** - Direct TLB shootdown notifications
+
+**UAPI Structures:**
+
+```c
+// User fence descriptor - passed in execbuffer flags/extensions
+struct drm_i915_user_fence {
+    __u32 handle;           // GEM handle to user-allocated buffer
+    __u32 offset;           // Offset within buffer (must be 8-byte aligned)
+};
+
+// User fence value structure in memory
+struct i915_user_fence_value {
+    __u64 value;            // Atomic value for comparison
+    __u64 timestamp;        // Optional: completion timestamp
+};
+
+// VM Bind with user fence
+struct drm_i915_gem_vm_bind {
+    __u64 vm_id;
+    __u64 start;            // VM address
+    __u64 length;           // Mapping length
+    __u64 offset;           // Object offset
+    __u32 flags;
+    __u32 extensions;       // Extended via batch_buffer_reloc
+};
+
+// User fence wait IOCTL
+struct drm_i915_gem_wait_user_fence {
+    __u64 vm_id;            // Address space context
+    __u64 fence_addr;       // GPA of fence value (PPGTT)
+    __u64 fence_value;      // Expected value to wait for
+    __u32 op;               // Operation: EQ, NEQ, GT, GTE, LT, LTE
+    __u32 flags;            // I915_WAIT_NOHANG, I915_WAIT_ABSOLUTE
+    __s64 timeout_ns;       // Timeout in nanoseconds
+};
+
+// Wait operation codes
+#define DRM_I915_USER_FENCE_EQ   0  // Wait until fence == value
+#define DRM_I915_USER_FENCE_NEQ  1  // Wait until fence != value
+#define DRM_I915_USER_FENCE_GT   2  // Wait until fence > value
+#define DRM_I915_USER_FENCE_GTE  3  // Wait until fence >= value
+#define DRM_I915_USER_FENCE_LT   4  // Wait until fence < value
+#define DRM_I915_USER_FENCE_LTE  5  // Wait until fence <= value
+```
+
+**Execution Modes:**
+
+| Mode | Description | Latency | Use Case |
+|------|-------------|---------|----------|
+| `ufence_page_ops` | Direct page write (fast) | ~100ns | Standard operations |
+| `ufence_mm_ops` | Memory management ops | ~500ns | Complex memory states |
+| `ufence_nops` | No-op (error/disabled) | N/A | Testing/fallback |
+
+**Performance Characteristics:**
+
+- **Notification Latency:** ~100ns (atomic memory write)
+- **No System Call:** Direct user-space memory write on GPU completion
+- **Conditional Waiting:** Hardware-assisted value comparison
+- **TLB Aware:** Integrated TLB synchronization
+
+**User-Space Example:**
+
+```c
+// 1. Allocate user fence buffer
+uint32_t fence_handle;
+struct drm_i915_gem_create create = {
+    .size = 4096,  // One page for fence values
+};
+drmIoctl(fd, DRM_IOCTL_I915_GEM_CREATE, &create);
+fence_handle = create.handle;
+
+// 2. Map fence buffer to user space
+void *fence_addr = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, fd, fence_handle << 12);
+
+// 3. Prepare VM bind with user fence
+struct drm_i915_gem_vm_bind vm_bind = {
+    .vm_id = my_vm_id,
+    .start = 0x1000000,
+    .length = 0x10000,
+    .offset = 0,
+    .flags = I915_GEM_VM_BIND_ASYNC,
+    // User fence notification setup would be in extensions
+};
+
+// 4. Execute batch with user fence notification
+struct drm_i915_gem_execbuffer2 exec = {
+    .buffers_ptr = (uintptr_t)objects,
+    .buffer_count = 1,
+    .batch_start_offset = 0,
+    .batch_len = batch_size,
+    // User fence for completion notification
+};
+drmIoctl(fd, DRM_IOCTL_I915_GEM_EXECBUFFER2, &exec);
+
+// 5. Wait for completion with conditional check
+struct drm_i915_gem_wait_user_fence wait = {
+    .vm_id = my_vm_id,
+    .fence_addr = (uintptr_t)fence_addr + fence_offset,
+    .fence_value = expected_completion_value,
+    .op = DRM_I915_USER_FENCE_EQ,
+    .flags = 0,
+    .timeout_ns = 1000000000LL,  // 1 second
+};
+int ret = drmIoctl(fd, DRM_IOCTL_I915_GEM_WAIT_USER_FENCE, &wait);
+
+if (ret == 0) {
+    printf("Execution completed!\n");
+} else if (errno == ETIME) {
+    printf("Timeout waiting for completion\n");
+}
+```
+
+**Implementation Details:**
+
+```c
+// Kernel-side: i915_gem_vm_bind_object.c (simplified)
+int i915_gem_vm_bind_with_ufence(struct drm_i915_gem_vm_bind *args)
+{
+    struct i915_user_fence *ufence = extract_ufence(args);
+    struct dma_fence_work *work;
+    
+    // 1. Create async bind operation
+    work = i915_gem_vm_bind_create_work(args);
+    
+    // 2. Attach user fence for completion
+    if (ufence) {
+        attach_user_fence_to_work(work, ufence);
+    }
+    
+    // 3. Queue for async execution
+    queue_work(work);
+    
+    // 4. On completion: dma_fence_work triggers user fence write
+    //    - GPU writes to user-allocated buffer at specified offset
+    //    - User space reads value without system call (polling/wait)
+    
+    return 0;
+}
+
+// User fence notification callback
+static void ufence_notify(struct dma_fence_work *work)
+{
+    struct user_fence *ufence = work->ufence;
+    
+    // 1. Get user page (already pinned during setup)
+    struct page *page = ufence->page;
+    
+    // 2. Write completion value atomically
+    atomic64_set((atomic64_t *)(page_address(page) + ufence->offset),
+                 ufence->value);
+    
+    // 3. TLB shootdown if needed
+    if (ufence->needs_tlb_sync)
+        i915_tlb_invalidate(ufence->vm);
+}
+```
+
+**Key Advantages Over Traditional Fences:**
+
+1. **Sub-microsecond Latency** - No system call overhead
+2. **Conditional Operations** - Hardware-assisted comparisons
+3. **Batch Optimizations** - Multiple fences in single operation
+4. **Memory Efficient** - Reuse allocated buffers
+5. **GPU-Aware** - Integrated with TLB synchronization
+
+**Limitations & Considerations:**
+
+- User buffer must be pinned during operation
+- Address must be within user's allocated PPGTT
+- 8-byte alignment requirement
+- Timeout handling varies by operation
+- Not suitable for inter-process synchronization
 
 ---
 
