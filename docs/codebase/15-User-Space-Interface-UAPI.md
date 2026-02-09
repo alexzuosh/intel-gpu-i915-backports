@@ -732,11 +732,240 @@ static void ufence_notify(struct dma_fence_work *work)
 - Timeout handling varies by operation
 - Not suitable for inter-process synchronization
 
+### User Fence Wait Queue Management
+
+The `i915_gem_wait_user_fence_ioctl()` implements a sophisticated three-level wait queue hierarchy to handle both normal completion and error conditions:
+
+#### **Three-Level Wait Queue Architecture**
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ Level 1: Global Device Wait Queue (drm_i915_private)            │
+├──────────────────────────────────────────────────────────────────┤
+│ struct wait_queue_head user_fence_wq                             │
+│                                                                  │
+│ Scope: Entire GPU device                                         │
+│ Purpose: Handle device-level errors and exceptional conditions   │
+│ Triggered by:                                                    │
+│   • PCI errors (hardware faults)                                 │
+│   • GPU wedged state (unrecoverable HW state)                    │
+│   • VM Bind completion (global operations)                       │
+│                                                                  │
+│ Wake-up Path: wake_up_all(&dev_priv->user_fence_wq)             │
+└──────────────────────────────────────────────────────────────────┘
+         ↓ (registered during wait initialization)
+         │
+┌────────▼──────────────────────────────────────────────────────────┐
+│ Level 2: Context Wait Queue (i915_gem_context)                   │
+├──────────────────────────────────────────────────────────────────┤
+│ struct wait_queue_head user_fence_wq                             │
+│                                                                  │
+│ Scope: Single GPU context                                        │
+│ Purpose: Handle context-specific errors                          │
+│ Triggered by:                                                    │
+│   • Context is banned (timeout, reset)                           │
+│   • Context is closed (destruction)                              │
+│   • Context becomes invalid                                      │
+│                                                                  │
+│ Wake-up Path: wake_up_all(&ctx->user_fence_wq)                  │
+│                                                                  │
+│ Benefit: Prevents unrelated contexts from being woken            │
+└──────────────────────────────────────────────────────────────────┘
+         ↓ (registered during wait initialization)
+         │
+┌────────▼──────────────────────────────────────────────────────────┐
+│ Level 3: Engine Breadcrumbs (intel_breadcrumbs)                  │
+├──────────────────────────────────────────────────────────────────┤
+│ struct wait_queue_head wq + struct irq_work irq_work            │
+│                                                                  │
+│ Scope: Per GPU engine (render, compute, etc.)                    │
+│ Purpose: GPU task completion notification (primary path)         │
+│ Triggered by:                                                    │
+│   • GPU writes seqno to HWSP (hardware completion)               │
+│   • MI_USER_INTERRUPT fires                                      │
+│   • signal_irq_work() processes completions                      │
+│                                                                  │
+│ Wake-up Path: wake_up_all(&engine->breadcrumbs->wq)             │
+│ Latency: <1μs (hardware interrupt driven)                        │
+│                                                                  │
+│ Benefit: Lowest latency path, independent per-engine             │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+#### **Wait Queue Registration Flow**
+
+```c
+int i915_gem_wait_user_fence_ioctl(struct drm_device *dev,
+                                   void *data,
+                                   struct drm_file *file)
+{
+    struct i915_gem_context *ctx = NULL;
+    struct engine_wait g_wait, c_wait;
+    
+    // Step 1: Register global device wait queue
+    add_soft_wait(&to_i915(dev)->user_fence_wq, &g_wait);
+    //             ↑ All device-level errors wake up here
+    //               (PCI errors, hardware failures)
+    
+    // Step 2: Register context wait queue (if context provided)
+    if (ctx) {
+        add_soft_wait(&ctx->user_fence_wq, &c_wait);
+        //             ↑ Context-specific errors
+        //               (ban, closure)
+        
+        // Link wait queue chain
+        g_wait.next = &c_wait;
+        
+        // Step 3: Register engine breadcrumbs for each relevant engine
+        err = add_gt_wait(ctx, &c_wait.next);
+        //                 ↑ GPU task completion signals
+        //                   (hardware interrupt driven)
+        if (err)
+            goto out_wait;
+    }
+    
+    // Enter main wait loop with all three queues registered
+    for (;;) {
+        set_current_state(TASK_INTERRUPTIBLE);
+        
+        // Check primary condition: user fence value
+        if (ufence_compare(&wake))
+            break;  // ← Normal completion path
+        
+        // Check device-level errors (woken by global WQ)
+        if (i915_is_pci_faulted(to_i915(dev))) {
+            err = -ENODEV;  // ← Device is faulty
+            break;
+        }
+        
+        // Check context-level errors (woken by context WQ)
+        if (ctx && i915_gem_context_is_banned(ctx)) {
+            err = -EIO;  // ← Context was banned
+            break;
+        }
+        
+        if (ctx && i915_gem_context_is_closed(ctx)) {
+            err = -ENOENT;  // ← Context was destroyed
+            break;
+        }
+        
+        // Check timeout
+        if (!timeout) {
+            err = -ETIME;  // ← Wait timed out
+            break;
+        }
+        
+        // Check signal
+        if (signal_pending(wake.tsk)) {
+            err = -ERESTARTSYS;  // ← Interrupted by signal
+            break;
+        }
+        
+        // Check memory fault
+        if (ufence_fault(&wake)) {
+            err = -EFAULT;  // ← User buffer page faulted
+            break;
+        }
+        
+        // Brief CPU spin to avoid context switch overhead
+        busy_wait(&wake, nsecs_to_jiffies(1));
+        
+        // If no wake-up, sleep and wait for breadcrumbs, context, or global WQ
+        timeout = i915_tbb_schedule(timeout);
+    }
+    
+    // Clean up all registered wait queues
+    remove_waits(&g_wait);  // Unregister all three levels
+    
+    return err;
+}
+```
+
+#### **Wake-up Path Analysis**
+
+| Scenario | Wake-up Trigger | Queue Level | Latency | Return Value |
+|----------|-----------------|-------------|---------|--------------|
+| **Normal Completion** | GPU finishes task → Breadcrumbs interrupt | Engine | <1μs | 0 (success) |
+| **Task Timeout** | Scheduler timeout → Context banned → WQ wake | Context | ~1-10ms | -EIO |
+| **Wait Timeout** | Timer expires | Software | Per app | -ETIME/-EAGAIN |
+| **PCI Hardware Error** | Error handler triggers | Global | ~1-10ms | -ENODEV |
+| **Context Closure** | App closes context/exits → WQ wake | Context | ~1-10ms | -ENOENT |
+| **Application Signal** | Signal sent to app | Software | Immediate | -ERESTARTSYS |
+
+#### **Concurrency Protection**
+
+```c
+// Wait queue registration is protected by context lock
+struct intel_context {
+    struct wait_queue_head user_fence_wq;  // ← Protected by context->lock
+    struct mutex lock;                      // ← Serializes access
+};
+
+// Global device queue is protected implicitly
+struct drm_i915_private {
+    struct wait_queue_head user_fence_wq;  // ← Always accessible
+};
+
+// Breadcrumbs use RCU + spinlock for minimal contention
+struct intel_breadcrumbs {
+    wait_queue_head_t wq;           // ← RCU protected
+    struct list_head signalers;     // ← RCU read-side
+    spinlock_t lock;                // ← Writer side lock
+};
+```
+
+#### **Design Benefits**
+
+| Aspect | Benefit |
+|--------|---------|
+| **Isolation** | Each context has independent WQ, errors don't affect other contexts |
+| **Performance** | Breadcrumbs provide <1μs latency for normal case without WQ overhead |
+| **Reliability** | Three-level backup ensures no wait gets missed |
+| **Scalability** | Per-context WQ prevents thundering herd on global WQ |
+| **Responsiveness** | Multiple paths (breadcrumbs, WQ, poll) cover all scenarios |
+| **Debuggability** | Can distinguish between hardware error, context error, and timeout |
+
+#### **Error Propagation Example**
+
+```
+Scenario: GPU hits a timeout on a long-running kernel
+
+Timeline:
+  T0: Application calls wait_user_fence_ioctl()
+      ├─ Registers global WQ
+      ├─ Registers context WQ
+      └─ Registers engine breadcrumbs
+
+  T1-T10: GPU executes tasks normally
+          ├─ Some tasks complete → breadcrumbs wake up with <1μs latency
+          └─ Application checks conditions, continues waiting
+
+  T10: GPU task hangs (infinite loop in shader)
+       ├─ Watchdog timer fires
+       ├─ Scheduler detects timeout
+       ├─ Context is banned: i915_gem_context_set_banned(ctx)
+       │   └─ wake_up_all(&ctx->user_fence_wq) ← Context WQ fires
+       └─ All applications waiting on this context are woken
+
+  T10+ε: Application is woken from schedule()
+         ├─ Re-checks conditions
+         ├─ Calls i915_gem_context_is_banned(ctx)
+         ├─ Returns true
+         └─ Ioctl returns -EIO to application
+
+  Application handles error:
+  ├─ Detects -EIO (context banned)
+  ├─ Creates new context
+  ├─ Resubmits work
+  └─ Continues execution
+
+Result: Application is notified of problem within ~1-10ms,
+        far faster than if it relied on timeout alone
+```
+
 ---
 
-## Error Handling
 
-### Common UAPI Errors
 
 ```plaintext
 UAPI Error Codes
