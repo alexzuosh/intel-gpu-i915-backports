@@ -1,6 +1,6 @@
 # Intel i915 GPU Driver - Complete Codebase Documentation
 
-**Documentation Version:** 3.6 | **Last Updated:** February 8, 2026 | **Status:** ✅ COMPLETE
+**Documentation Version:** 3.7 | **Last Updated:** February 8, 2026 | **Status:** ✅ COMPLETE
 
 ---
 
@@ -10,7 +10,7 @@ This comprehensive documentation covers all major functional components of the I
 
 **📊 Quick Stats:**
 - **35 total documents** (25 core + 10 reference)
-- **28,500+ lines** of documentation
+- **29,000+ lines** of documentation
 - **180+ diagrams** and visualizations
 - **150+ code examples** from real i915 source
 - **100% coverage** of all planned topics (10-22 complete)
@@ -83,7 +83,7 @@ This comprehensive documentation covers all major functional components of the I
 → [13-Firmware-Loading-Management.md](./13-Firmware-Loading-Management.md) - GuC/HuC firmware
 
 **Working on User-Space Interface?**
-→ [15-User-Space-Interface-UAPI.md](./15-User-Space-Interface-UAPI.md) - GEM API & UAPI
+→ [15-User-Space-Interface-UAPI.md](./15-User-Space-Interface-UAPI.md) - GEM API, UAPI, **User Fence (ufence)**
 
 **Working on Display System?**
 → [17-Display-Output-Management.md](./17-Display-Output-Management.md) - Display pipeline

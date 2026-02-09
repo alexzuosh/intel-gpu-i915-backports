@@ -1,6 +1,6 @@
 # Intel i915 GPU Driver Documentation Index
 
-**Version:** 3.6 | **Last Updated:** February 8, 2026 | **Total Content:** 180+ diagrams, 28,500+ lines | **Status:** ✅ COMPLETE
+**Version:** 3.7 | **Last Updated:** February 8, 2026 | **Total Content:** 180+ diagrams, 29,000+ lines | **Status:** ✅ COMPLETE
 
 ---
 
@@ -60,7 +60,7 @@ Critical infrastructure systems and operational subsystems.
 | 12 | [12-Interrupt-Handling.md](12-Interrupt-Handling.md) | Interrupt processing & management | 380 | 3 |
 | 13 | [13-Firmware-Loading-Management.md](13-Firmware-Loading-Management.md) | GuC/HuC firmware loading & verification | 380 | 3 |
 | 14 | [14-Performance-Monitoring-OA.md](14-Performance-Monitoring-OA.md) | Performance monitoring & counters | 420 | 3 |
-| 15 | [15-User-Space-Interface-UAPI.md](15-User-Space-Interface-UAPI.md) | GEM API & user-space interface | 450 | 4 |
+| 15 | [15-User-Space-Interface-UAPI.md](15-User-Space-Interface-UAPI.md) | GEM API, user-space interface, **User Fence (ufence)** | 930 | 4 |
 | 16 | [16-Runtime-Power-Management.md](16-Runtime-Power-Management.md) | Runtime PM & autosuspend | 400 | 3 |
 
 ### TIER 3 Extended: System Features (NEW - 17-22)
@@ -403,7 +403,7 @@ Week 2: Advanced Topics
 - **Documentation:** 35 total files (25 core + 10 reference)
 - **Code Examples:** 150+ real i915 kernel code snippets
 - **Diagrams:** 180+ flow diagrams and architecture visualizations
-- **Total Content:** 28,500+ lines of comprehensive documentation
+- **Total Content:** 29,000+ lines of comprehensive documentation (including User Fence deep-dive)
 
 ---  
 **Maintained by:** Intel GPU Driver Documentation Team  
