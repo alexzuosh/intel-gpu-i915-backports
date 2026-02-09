@@ -1,6 +1,6 @@
 # Intel i915 GPU Driver Documentation Index
 
-**Version:** 3.7 | **Last Updated:** February 8, 2026 | **Total Content:** 180+ diagrams, 29,000+ lines | **Status:** ✅ COMPLETE
+**Version:** 3.8 | **Last Updated:** February 8, 2026 | **Total Content:** 180+ diagrams, 29,300+ lines | **Status:** ✅ COMPLETE
 
 ---
 
@@ -48,7 +48,7 @@ In-depth coverage of specialized subsystems.
 | 07b | [07b-TBB-Implementation-Guide.md](07b-TBB-Implementation-Guide.md) | TBB implementation patterns | 350+ | 3 |
 | 08 | [08-Debugger-Support.md](08-Debugger-Support.md) | Debug infrastructure | 420 | 2 |
 | 08b | [08b-Debugger-Implementation.md](08b-Debugger-Implementation.md) | Debugger implementation details | 400+ | 2 |
-| 09 | [09-i915-Fence-Timeline-Study.md](09-i915-Fence-Timeline-Study.md) | Fence lifecycle & synchronization | 850 | 5 |
+| 09 | [09-i915-Fence-Timeline-Study.md](09-i915-Fence-Timeline-Study.md) | Fence lifecycle, Breadcrumbs, synchronization | 1,628 | 5 |
 
 ### TIER 2 Extended: Infrastructure & Operations (NEW - 10-16)
 Critical infrastructure systems and operational subsystems.
@@ -403,7 +403,7 @@ Week 2: Advanced Topics
 - **Documentation:** 35 total files (25 core + 10 reference)
 - **Code Examples:** 150+ real i915 kernel code snippets
 - **Diagrams:** 180+ flow diagrams and architecture visualizations
-- **Total Content:** 29,000+ lines of comprehensive documentation (including User Fence deep-dive)
+- **Total Content:** 29,300+ lines of comprehensive documentation (including Breadcrumbs deep-dive)
 
 ---  
 **Maintained by:** Intel GPU Driver Documentation Team  

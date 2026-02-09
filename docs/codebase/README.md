@@ -1,6 +1,6 @@
 # Intel i915 GPU Driver - Complete Codebase Documentation
 
-**Documentation Version:** 3.7 | **Last Updated:** February 8, 2026 | **Status:** ✅ COMPLETE
+**Documentation Version:** 3.8 | **Last Updated:** February 8, 2026 | **Status:** ✅ COMPLETE
 
 ---
 
@@ -10,7 +10,7 @@ This comprehensive documentation covers all major functional components of the I
 
 **📊 Quick Stats:**
 - **35 total documents** (25 core + 10 reference)
-- **29,000+ lines** of documentation
+- **29,300+ lines** of documentation
 - **180+ diagrams** and visualizations
 - **150+ code examples** from real i915 source
 - **100% coverage** of all planned topics (10-22 complete)
@@ -72,7 +72,7 @@ This comprehensive documentation covers all major functional components of the I
 → Study [07-TBB-Task-Scheduling.md](./07-TBB-Task-Scheduling.md) for CPU task framework
 
 **Working on Interrupts & Errors?**
-→ [09-i915-Fence-Timeline-Study.md](./09-i915-Fence-Timeline-Study.md) - Synchronization primitives
+→ [09-i915-Fence-Timeline-Study.md](./09-i915-Fence-Timeline-Study.md) - Synchronization primitives, **Breadcrumbs hardware interrupt mechanism**
 → [11-Error-Handling-Recovery.md](./11-Error-Handling-Recovery.md) - Error detection & recovery
 → [12-Interrupt-Handling.md](./12-Interrupt-Handling.md) - Interrupt processing
 
